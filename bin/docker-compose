@@ -1,0 +1,1186 @@
+#!/usr/bin/env python3
+"""
+compose-shim: a docker compose subset backed by Apple `container`.
+
+Implements the common compose workflow (up/down/ps/logs/exec/run/build/pull/
+start/stop/restart/config) by translating a compose file into individual
+`container` CLI calls. Service discovery is provided by injecting service IPs
+into every container's /etc/hosts after startup (Apple container has no
+reliable per-network DNS for bare names).
+
+Environment variables:
+  DOCKER_SHIM_DEBUG=1          print every container CLI call
+  DOCKER_SHIM_CONTAINER_BIN    path to the `container` binary (default: container)
+"""
+
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import threading
+
+SHIM_VERSION = "0.3.0"
+CONTAINER_BIN = os.environ.get("DOCKER_SHIM_CONTAINER_BIN", "container")
+DEBUG = os.environ.get("DOCKER_SHIM_DEBUG", "") not in ("", "0")
+
+HOSTS_MARKER = "#compose-shim"
+
+
+def warn(msg):
+    print(f"compose-shim: warning: {msg}", file=sys.stderr)
+
+
+def die(msg, code=1):
+    print(f"compose-shim: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run_cli(args, **kwargs):
+    argv = [CONTAINER_BIN, *args]
+    if DEBUG:
+        print(f"compose-shim: run: {shlex.join(argv)}", file=sys.stderr)
+    try:
+        return subprocess.run(argv, **kwargs)
+    except FileNotFoundError:
+        die(f"'{CONTAINER_BIN}' not found — is Apple container installed?")
+
+
+def exec_cli(args):
+    argv = [CONTAINER_BIN, *args]
+    if DEBUG:
+        print(f"compose-shim: exec: {shlex.join(argv)}", file=sys.stderr)
+    try:
+        os.execvp(argv[0], argv)
+    except FileNotFoundError:
+        die(f"'{CONTAINER_BIN}' not found — is Apple container installed?")
+
+
+# ---------------------------------------------------------------------------
+# YAML loading (PyYAML if available, else macOS system ruby)
+
+def load_yaml(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        die(f"cannot read {path}: {e}")
+    try:
+        import yaml
+        try:
+            return yaml.safe_load(text)
+        except yaml.YAMLError as e:
+            die(f"failed to parse {path}: {e}")
+    except ImportError:
+        pass
+    ruby_prog = (
+        "require 'yaml'; require 'json'; "
+        "begin; d = YAML.safe_load(STDIN.read, aliases: true); "
+        "rescue ArgumentError; d = YAML.safe_load(STDIN.read); end; "
+        "puts JSON.generate(d)"
+    )
+    for ruby in ("/usr/bin/ruby", "ruby"):
+        try:
+            r = subprocess.run([ruby, "-e", ruby_prog], input=text,
+                               capture_output=True, text=True)
+        except FileNotFoundError:
+            continue
+        if r.returncode == 0:
+            return json.loads(r.stdout)
+        die(f"failed to parse {path}: {r.stderr.strip()}")
+    die("no YAML parser available: run 'pip3 install pyyaml' "
+        "or make sure /usr/bin/ruby exists")
+
+
+# ---------------------------------------------------------------------------
+# environment & interpolation
+
+def parse_env_file(path):
+    env = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                    v = v[1:-1]
+                env[k.strip()] = v
+    except OSError as e:
+        die(f"cannot read env file {path}: {e}")
+    return env
+
+
+VAR_RE = re.compile(
+    r"\$\$"
+    r"|\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-?])([^}]*))?\}"
+    r"|\$([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def interpolate_str(s, env):
+    def repl(m):
+        if m.group(0) == "$$":
+            return "$"
+        name = m.group(1) or m.group(4)
+        op, arg = m.group(2), m.group(3)
+        val = env.get(name)
+        if op in (":-", "-"):
+            missing = val is None or (op == ":-" and val == "")
+            return arg if missing else val
+        if op in (":?", "?"):
+            missing = val is None or (op == ":?" and val == "")
+            if missing:
+                die(f"required variable {name} is missing: {arg or 'not set'}")
+            return val
+        return val if val is not None else ""
+    return VAR_RE.sub(repl, s)
+
+
+def interpolate(obj, env):
+    if isinstance(obj, str):
+        return interpolate_str(obj, env)
+    if isinstance(obj, list):
+        return [interpolate(x, env) for x in obj]
+    if isinstance(obj, dict):
+        return {k: interpolate(v, env) for k, v in obj.items()}
+    return obj
+
+
+def deep_merge(base, over):
+    if isinstance(base, dict) and isinstance(over, dict):
+        out = dict(base)
+        for k, v in over.items():
+            out[k] = deep_merge(base[k], v) if k in base else v
+        return out
+    return over
+
+
+# ---------------------------------------------------------------------------
+# project model
+
+DEFAULT_FILES = ("compose.yaml", "compose.yml",
+                 "docker-compose.yaml", "docker-compose.yml")
+
+
+class Project:
+    def __init__(self, opts):
+        files = list(opts.get("files") or [])
+        if not files and os.environ.get("COMPOSE_FILE"):
+            files = os.environ["COMPOSE_FILE"].split(os.pathsep)
+        if not files:
+            d = os.getcwd()
+            while True:
+                for cand in DEFAULT_FILES:
+                    p = os.path.join(d, cand)
+                    if os.path.isfile(p):
+                        files = [p]
+                        break
+                if files or os.path.dirname(d) == d:
+                    break
+                d = os.path.dirname(d)
+        if not files:
+            die("no compose file found (looked for compose.yaml / compose.yml "
+                "/ docker-compose.yaml / docker-compose.yml)")
+        self.files = [os.path.abspath(f) for f in files]
+        self.dir = os.path.abspath(opts.get("project_directory")
+                                   or os.path.dirname(self.files[0]))
+
+        env = dict(os.environ)
+        dotenv = opts.get("env_file") or os.path.join(self.dir, ".env")
+        if os.path.isfile(dotenv):
+            for k, v in parse_env_file(dotenv).items():
+                env.setdefault(k, v)  # real environment wins
+        self.env = env
+
+        model = {}
+        for f in self.files:
+            data = load_yaml(f)
+            if not isinstance(data, dict):
+                die(f"{f} is not a valid compose file")
+            model = deep_merge(model, data)
+        self.model = interpolate(model, env)
+
+        raw_name = (opts.get("project_name")
+                    or env.get("COMPOSE_PROJECT_NAME")
+                    or self.model.get("name")
+                    or os.path.basename(self.dir))
+        self.name = re.sub(r"[^a-z0-9_-]", "", str(raw_name).lower()) or "default"
+
+        self.services = self.model.get("services") or {}
+        if not isinstance(self.services, dict) or not self.services:
+            die("compose file has no services")
+        self.top_volumes = self.model.get("volumes") or {}
+        self.top_networks = self.model.get("networks") or {}
+        self._warned = set()
+
+    def warn_once(self, key, msg):
+        if key not in self._warned:
+            self._warned.add(key)
+            warn(msg)
+
+    # -- naming ------------------------------------------------------------
+    def container_name(self, svc):
+        cfg = self.services[svc]
+        return cfg.get("container_name") or f"{self.name}-{svc}-1"
+
+    def network_name(self, key="default"):
+        cfg = self.top_networks.get(key) or {}
+        if cfg.get("external"):
+            return cfg.get("name") or key
+        return cfg.get("name") or f"{self.name}_{key}"
+
+    def volume_name(self, key):
+        if key not in self.top_volumes:
+            die(f"volume '{key}' is used but not declared in the top-level "
+                "'volumes:' section")
+        cfg = self.top_volumes.get(key) or {}
+        if cfg.get("external"):
+            return cfg.get("name") or key
+        return cfg.get("name") or f"{self.name}_{key}"
+
+    # -- dependency graph ----------------------------------------------------
+    def deps_of(self, svc):
+        d = self.services[svc].get("depends_on") or []
+        if isinstance(d, dict):
+            for name, cond in d.items():
+                cond = (cond or {}).get("condition", "service_started")
+                if cond != "service_started":
+                    self.warn_once(f"cond:{svc}:{name}",
+                                   f"depends_on condition '{cond}' on "
+                                   f"{svc}->{name} is treated as service_started")
+            return list(d.keys())
+        return list(d)
+
+    def closure(self, names):
+        todo, seen = list(names), set()
+        while todo:
+            s = todo.pop()
+            if s in seen:
+                continue
+            if s not in self.services:
+                die(f"no such service: {s}")
+            seen.add(s)
+            todo.extend(self.deps_of(s))
+        return seen
+
+    def topo_order(self, selected):
+        order, done, visiting = [], set(), set()
+
+        def visit(s):
+            if s in done:
+                return
+            if s in visiting:
+                die(f"dependency cycle involving service '{s}'")
+            visiting.add(s)
+            for d in self.deps_of(s):
+                if d in selected:
+                    visit(d)
+            visiting.discard(s)
+            done.add(s)
+            order.append(s)
+
+        for s in sorted(selected):
+            visit(s)
+        return order
+
+    def selected_services(self, args):
+        return self.closure(args) if args else set(self.services)
+
+    def named_services(self, args):
+        """Explicit selection without dependency closure (stop/restart/...)."""
+        for s in args:
+            if s not in self.services:
+                die(f"no such service: {s}")
+        return set(args) if args else set(self.services)
+
+
+# ---------------------------------------------------------------------------
+# service -> `container run` arguments
+
+def as_str(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
+def env_flags(cfg):
+    out = []
+    envs = cfg.get("environment") or {}
+    if isinstance(envs, list):
+        for item in envs:
+            out += ["--env", str(item)]
+    else:
+        for k, v in envs.items():
+            out += ["--env", k if v is None else f"{k}={as_str(v)}"]
+    return out
+
+
+def port_flags(proj, svc, cfg):
+    out = []
+    for p in cfg.get("ports") or []:
+        if isinstance(p, dict):
+            pub, tgt = p.get("published"), p.get("target")
+            if not pub or not tgt:
+                proj.warn_once(f"port:{svc}:{p}",
+                               f"{svc}: port entry {p} needs both 'published' "
+                               "and 'target'; skipping")
+                continue
+            spec = f"{pub}:{tgt}"
+            if p.get("host_ip"):
+                spec = f"{p['host_ip']}:{spec}"
+            if p.get("protocol"):
+                spec += f"/{p['protocol']}"
+        else:
+            spec = str(p)
+            body = spec.split("/")[0]
+            if "-" in body:
+                proj.warn_once(f"port:{svc}:{spec}",
+                               f"{svc}: port ranges ({spec}) are not supported; "
+                               "skipping")
+                continue
+            if len(body.split(":")) < 2:
+                proj.warn_once(f"port:{svc}:{spec}",
+                               f"{svc}: port '{spec}' has no host port (random "
+                               "ports are not supported); skipping")
+                continue
+        out += ["--publish", spec]
+    return out
+
+
+def volume_flags(proj, svc, cfg):
+    out = []
+    for v in cfg.get("volumes") or []:
+        ro = False
+        if isinstance(v, dict):
+            vtype = v.get("type", "volume")
+            src, tgt = v.get("source"), v.get("target")
+            ro = bool(v.get("read_only"))
+            if vtype == "tmpfs":
+                out += ["--tmpfs", tgt]
+                continue
+            if vtype not in ("bind", "volume"):
+                proj.warn_once(f"vol:{svc}:{vtype}",
+                               f"{svc}: volume type '{vtype}' unsupported; skipping")
+                continue
+            is_bind = vtype == "bind"
+        else:
+            parts = str(v).split(":")
+            if len(parts) == 1:
+                src, tgt = None, parts[0]
+                is_bind = False
+            else:
+                src, tgt = parts[0], parts[1]
+                ro = len(parts) > 2 and "ro" in parts[2].split(",")
+                is_bind = src.startswith((".", "/", "~"))
+        if src is None:
+            # anonymous volume: keep it stable per service+path
+            slug = re.sub(r"[^a-z0-9]+", "-", tgt.lower()).strip("-")
+            src = f"{proj.name}_{svc}_{slug}"
+            ensure_volume(src)
+        elif is_bind:
+            src = os.path.abspath(os.path.join(proj.dir, os.path.expanduser(src)))
+            if not os.path.exists(src):
+                os.makedirs(src, exist_ok=True)
+        else:
+            src = proj.volume_name(src)
+        out += ["--volume", f"{src}:{tgt}" + (":ro" if ro else "")]
+    return out
+
+
+UNSUPPORTED_KEYS = {
+    "restart": "restart policies (use launchd or a supervisor on the host)",
+    "healthcheck": "healthchecks",
+    "hostname": "custom hostnames",
+    "privileged": "privileged mode",
+    "devices": "device passthrough",
+    "sysctls": "sysctls",
+    "security_opt": "security options",
+    "group_add": "extra groups",
+    "ipc": "ipc mode",
+    "pid": "pid mode",
+    "network_mode": "network_mode (host/bridge modes)",
+    "links": "links (use depends_on + service names)",
+    "secrets": "secrets",
+    "configs": "configs",
+    "cgroup_parent": "cgroup options",
+}
+
+
+def service_run_args(proj, svc):
+    cfg = proj.services[svc]
+    args = ["--name", proj.container_name(svc)]
+    args += ["--label", f"com.docker.compose.project={proj.name}",
+             "--label", f"com.docker.compose.service={svc}"]
+
+    for key, what in UNSUPPORTED_KEYS.items():
+        if key in cfg:
+            proj.warn_once(f"key:{svc}:{key}", f"{svc}: {what} not supported; ignored")
+
+    nets = cfg.get("networks") or ["default"]
+    if isinstance(nets, dict):
+        nets = list(nets.keys())
+    if len(nets) > 1:
+        proj.warn_once(f"nets:{svc}",
+                       f"{svc}: multiple networks; only '{nets[0]}' is attached")
+    args += ["--network", proj.network_name(nets[0])]
+
+    args += env_flags(cfg)
+    for ef in _as_list(cfg.get("env_file")):
+        path = ef.get("path") if isinstance(ef, dict) else ef
+        args += ["--env-file",
+                 os.path.abspath(os.path.join(proj.dir, os.path.expanduser(path)))]
+    args += port_flags(proj, svc, cfg)
+    args += volume_flags(proj, svc, cfg)
+
+    for t in _as_list(cfg.get("tmpfs")):
+        args += ["--tmpfs", t]
+    if cfg.get("user"):
+        args += ["--user", str(cfg["user"])]
+    if cfg.get("working_dir"):
+        args += ["--workdir", cfg["working_dir"]]
+    if cfg.get("platform"):
+        args += ["--platform", cfg["platform"]]
+    if cfg.get("shm_size"):
+        args += ["--shm-size", str(cfg["shm_size"])]
+    if cfg.get("read_only"):
+        args += ["--read-only"]
+    if cfg.get("init"):
+        args += ["--init"]
+    if cfg.get("tty"):
+        args += ["--tty"]
+    if cfg.get("stdin_open"):
+        args += ["--interactive"]
+    for c in _as_list(cfg.get("cap_add")):
+        args += ["--cap-add", c]
+    for c in _as_list(cfg.get("cap_drop")):
+        args += ["--cap-drop", c]
+    for d in _as_list(cfg.get("dns")):
+        args += ["--dns", d]
+    for d in _as_list(cfg.get("dns_search")):
+        args += ["--dns-search", d]
+
+    labels = cfg.get("labels") or {}
+    if isinstance(labels, list):
+        for item in labels:
+            args += ["--label", str(item)]
+    else:
+        for k, v in labels.items():
+            args += ["--label", f"{k}={as_str(v)}"]
+
+    ulimits = cfg.get("ulimits") or {}
+    for name, v in ulimits.items():
+        if isinstance(v, dict):
+            args += ["--ulimit", f"{name}={v.get('soft')}:{v.get('hard')}"]
+        else:
+            args += ["--ulimit", f"{name}={v}:{v}"]
+
+    limits = ((cfg.get("deploy") or {}).get("resources") or {}).get("limits") or {}
+    cpus = cfg.get("cpus") or limits.get("cpus")
+    memory = cfg.get("mem_limit") or limits.get("memory")
+    if cpus:
+        args += ["--cpus", str(int(float(cpus)) or 1)]
+    if memory:
+        args += ["--memory", str(memory)]
+
+    replicas = (cfg.get("deploy") or {}).get("replicas") or cfg.get("scale")
+    if replicas and int(replicas) > 1:
+        proj.warn_once(f"scale:{svc}",
+                       f"{svc}: replicas/scale > 1 not supported; running 1 instance")
+
+    # entrypoint / command
+    tail = []
+    entrypoint = cfg.get("entrypoint")
+    if entrypoint is not None:
+        ep = shlex.split(entrypoint) if isinstance(entrypoint, str) else list(entrypoint)
+        if ep:
+            args += ["--entrypoint", ep[0]]
+            tail += ep[1:]
+        else:
+            args += ["--entrypoint", ""]
+    command = cfg.get("command")
+    if command is not None:
+        tail += shlex.split(command) if isinstance(command, str) else [str(c) for c in command]
+
+    image = cfg.get("image") or f"{proj.name}-{svc}"
+    return args, image, tail
+
+
+def _as_list(v):
+    if v is None:
+        return []
+    return v if isinstance(v, list) else [v]
+
+
+# ---------------------------------------------------------------------------
+# infrastructure (networks / volumes) and runtime state
+
+def _ensure(kind, name):
+    r = run_cli([kind, "create", name], capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f" ✔ {kind.capitalize()} {name}  Created")
+        return True
+    if "exist" in (r.stderr or "").lower():
+        return True
+    warn(f"could not create {kind} '{name}': {(r.stderr or '').strip()}")
+    return False
+
+
+def ensure_volume(name):
+    _ensure("volume", name)
+
+
+def ensure_infra(proj, selected):
+    nets = set()
+    for s in selected:
+        n = proj.services[s].get("networks") or ["default"]
+        n = list(n.keys()) if isinstance(n, dict) else list(n)
+        nets.add(n[0])
+    for n in sorted(nets):
+        cfg = proj.top_networks.get(n) or {}
+        if not cfg.get("external"):
+            if not _ensure("network", proj.network_name(n)):
+                die("cannot create the project network (custom networks need "
+                    "macOS 26+); aborting")
+    vols = set()
+    for s in selected:
+        for v in proj.services[s].get("volumes") or []:
+            if isinstance(v, dict):
+                if v.get("type", "volume") == "volume" and v.get("source"):
+                    vols.add(v["source"])
+            else:
+                parts = str(v).split(":")
+                if len(parts) > 1 and not parts[0].startswith((".", "/", "~")):
+                    vols.add(parts[0])
+    for v in sorted(vols):
+        if v not in proj.top_volumes:
+            die(f"volume '{v}' is used but not declared in the top-level "
+                "'volumes:' section")
+        if not (proj.top_volumes.get(v) or {}).get("external"):
+            ensure_volume(proj.volume_name(v))
+
+
+def list_state():
+    """name -> {'state': str, 'ip': str, 'image': str}"""
+    r = run_cli(["list", "--all", "--format", "json"],
+                capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"container list failed: {(r.stderr or '').strip()}")
+    out = {}
+    for c in json.loads(r.stdout or "[]"):
+        conf = c.get("configuration") or {}
+        name = conf.get("id")
+        nets = (c.get("networks") or [])
+        ip = (nets[0].get("address", "") if nets else "").split("/")[0]
+        if not ip:
+            snets = (c.get("status") or {}).get("networks") or []
+            ip = (snets[0].get("ipv4Address", "") if snets else "").split("/")[0]
+        out[name] = {
+            "state": c.get("status", "unknown") if isinstance(c.get("status"), str)
+                     else (c.get("status") or {}).get("state", "unknown"),
+            "ip": ip,
+            "image": (conf.get("image") or {}).get("reference", ""),
+        }
+    return out
+
+
+def image_exists(ref):
+    r = run_cli(["image", "inspect", ref], capture_output=True, text=True)
+    return r.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# /etc/hosts based service discovery
+
+def hosts_entries(proj):
+    state = list_state()
+    entries = []
+    for svc in proj.services:
+        cname = proj.container_name(svc)
+        info = state.get(cname)
+        if info and info["state"] == "running" and info["ip"]:
+            names = svc if svc == cname else f"{svc} {cname}"
+            entries.append(f"{info['ip']}\t{names}\t{HOSTS_MARKER}")
+    extra_seen = set()
+    for svc in proj.services:
+        for eh in _as_list(proj.services[svc].get("extra_hosts")):
+            host, _, ip = str(eh).partition(":")
+            if ip and eh not in extra_seen:
+                extra_seen.add(eh)
+                entries.append(f"{ip}\t{host}\t{HOSTS_MARKER}")
+    return entries
+
+
+def inject_hosts(proj, running_names):
+    entries = hosts_entries(proj)
+    if not entries:
+        return
+    block = "\n".join(entries) + "\n"
+    script = (f"grep -v '{HOSTS_MARKER}' /etc/hosts > /tmp/.hosts.new 2>/dev/null; "
+              f"cat /tmp/.hosts.new > /etc/hosts; rm -f /tmp/.hosts.new; "
+              f"cat >> /etc/hosts")
+    for cname in running_names:
+        r = run_cli(["exec", "--interactive", cname, "/bin/sh", "-c", script],
+                    input=block, capture_output=True, text=True)
+        if r.returncode != 0:
+            warn(f"could not update /etc/hosts in {cname} (no /bin/sh?); "
+                 "service names will not resolve there")
+
+
+# ---------------------------------------------------------------------------
+# log streaming
+
+def stream_logs(names, follow, tail=None, timestamps_warned=False):
+    if not names:
+        return
+    width = max(len(n) for n in names)
+    procs = []
+    for n in names:
+        argv = [CONTAINER_BIN, "logs"]
+        if follow:
+            argv.append("--follow")
+        if tail is not None:
+            argv += ["-n", str(tail)]
+        argv.append(n)
+        try:
+            procs.append((n, subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                              stderr=subprocess.STDOUT, text=True)))
+        except FileNotFoundError:
+            die(f"'{CONTAINER_BIN}' not found")
+
+    def pump(name, proc):
+        for line in proc.stdout:
+            sys.stdout.write(f"{name:<{width}} | {line}")
+            sys.stdout.flush()
+
+    threads = [threading.Thread(target=pump, args=(n, p), daemon=True)
+               for n, p in procs]
+    for t in threads:
+        t.start()
+    try:
+        for _, p in procs:
+            p.wait()
+        for t in threads:
+            t.join(timeout=2)
+    except KeyboardInterrupt:
+        for _, p in procs:
+            p.terminate()
+        raise
+
+
+# ---------------------------------------------------------------------------
+# commands
+
+def bring_up(proj, selected, build=False, force_recreate=False):
+    order = proj.topo_order(selected)
+    ensure_infra(proj, selected)
+    state = list_state()
+    started = []
+    for svc in order:
+        cfg = proj.services[svc]
+        cname = proj.container_name(svc)
+        args, image, tail = service_run_args(proj, svc)
+        if "build" in cfg and (build or not image_exists(image)):
+            do_build(proj, svc, image)
+        existing = state.get(cname)
+        if existing and force_recreate:
+            run_cli(["delete", "--force", cname], capture_output=True)
+            existing = None
+        if existing:
+            if existing["state"] == "running":
+                print(f" ✔ Container {cname}  Running")
+            else:
+                r = run_cli(["start", cname], capture_output=True, text=True)
+                if r.returncode != 0:
+                    die(f"failed to start {cname}: {(r.stderr or '').strip()}")
+                print(f" ✔ Container {cname}  Started")
+        else:
+            r = run_cli(["run", "--detach", *args, image, *tail],
+                        capture_output=True, text=True)
+            if r.returncode != 0:
+                die(f"failed to create {cname}: {(r.stderr or '').strip()}")
+            print(f" ✔ Container {cname}  Started")
+        started.append(cname)
+    inject_hosts(proj, started)
+    return started
+
+
+def cmd_up(proj, args):
+    detach = build = force = False
+    services = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-d", "--detach"):
+            detach = True
+        elif a == "--build":
+            build = True
+        elif a == "--force-recreate":
+            force = True
+        elif a in ("--no-recreate", "--remove-orphans", "--wait", "--quiet-pull",
+                   "--no-start", "--no-deps", "--no-build", "--yes", "-y"):
+            pass  # accepted, no-op or default behavior
+        elif a in ("-t", "--timeout", "--pull", "--scale", "--wait-timeout"):
+            i += 1
+        elif a.startswith("-"):
+            warn(f"ignoring unsupported 'up' option {a}")
+        else:
+            services.append(a)
+        i += 1
+    selected = proj.selected_services(services)
+    started = bring_up(proj, selected, build=build, force_recreate=force)
+    if not detach:
+        print("Attaching to logs (Ctrl-C stops the containers)...")
+        try:
+            stream_logs(started, follow=True)
+        except KeyboardInterrupt:
+            print("\nGracefully stopping...")
+            run_cli(["stop", *started], capture_output=True)
+            sys.exit(130)
+
+
+def cmd_down(proj, args):
+    remove_volumes = any(a in ("-v", "--volumes") for a in args)
+    order = list(reversed(proj.topo_order(set(proj.services))))
+    state = list_state()
+    for svc in order:
+        cname = proj.container_name(svc)
+        if cname not in state:
+            continue
+        run_cli(["stop", cname], capture_output=True)
+        r = run_cli(["delete", "--force", cname], capture_output=True, text=True)
+        if r.returncode == 0:
+            print(f" ✔ Container {cname}  Removed")
+        else:
+            warn(f"could not remove {cname}: {(r.stderr or '').strip()}")
+    nets = {proj.network_name(k) for k in (list(proj.top_networks) or ["default"])
+            if not (proj.top_networks.get(k) or {}).get("external")}
+    nets.add(proj.network_name("default"))
+    for n in sorted(nets):
+        r = run_cli(["network", "delete", n], capture_output=True, text=True)
+        if r.returncode == 0:
+            print(f" ✔ Network {n}  Removed")
+    if remove_volumes:
+        for v in proj.top_volumes:
+            if (proj.top_volumes.get(v) or {}).get("external"):
+                continue
+            r = run_cli(["volume", "delete", proj.volume_name(v)],
+                        capture_output=True, text=True)
+            if r.returncode == 0:
+                print(f" ✔ Volume {proj.volume_name(v)}  Removed")
+
+
+def cmd_ps(proj, args):
+    quiet = any(a in ("-q", "--quiet") for a in args)
+    services = [a for a in args if not a.startswith("-")]
+    state = list_state()
+    rows = []
+    for svc in sorted(services or proj.services):
+        cname = proj.container_name(svc)
+        info = state.get(cname)
+        if info:
+            rows.append((cname, svc, info["state"], info["ip"] or "-",
+                         info["image"]))
+    if quiet:
+        for r in rows:
+            print(r[0])
+        return
+    if not rows:
+        print("no containers found for this project")
+        return
+    widths = [max(len(str(r[i])) for r in rows + [("NAME", "SERVICE", "STATE",
+                                                   "IP", "IMAGE")]) for i in range(5)]
+    header = ("NAME", "SERVICE", "STATE", "IP", "IMAGE")
+    for r in [header] + rows:
+        print("  ".join(str(c).ljust(w) for c, w in zip(r, widths)))
+
+
+def cmd_logs(proj, args):
+    follow = False
+    tail = None
+    services = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-f", "--follow"):
+            follow = True
+        elif a in ("--tail", "-n"):
+            i += 1
+            tail = args[i]
+        elif a.startswith("--tail="):
+            tail = a.split("=", 1)[1]
+        elif a in ("-t", "--timestamps"):
+            warn("timestamps are not supported; ignored")
+        elif a.startswith("-"):
+            warn(f"ignoring unsupported 'logs' option {a}")
+        else:
+            services.append(a)
+        i += 1
+    state = list_state()
+    names = [proj.container_name(s) for s in (services or sorted(proj.services))]
+    names = [n for n in names if n in state]
+    if not names:
+        die("no containers found for this project")
+    stream_logs(names, follow=follow, tail=tail)
+
+
+def _simple_lifecycle(proj, args, verbs):
+    """verbs: list of container CLI commands to apply in order."""
+    services = [a for a in args if not a.startswith("-")]
+    selected = proj.named_services(services)
+    state = list_state()
+    reverse = verbs[0] in ("stop", "kill", "delete")
+    order = proj.topo_order(selected)
+    if reverse:
+        order = list(reversed(order))
+    done_word = {"start": "Started", "stop": "Stopped",
+                 "kill": "Killed", "delete": "Removed"}
+    rc = 0
+    touched = []
+    for svc in order:
+        cname = proj.container_name(svc)
+        if cname not in state:
+            continue
+        ok = True
+        for verb in verbs:
+            r = run_cli([verb, cname], capture_output=True, text=True)
+            if r.returncode != 0 and verb == verbs[-1]:
+                warn(f"{verb} {cname}: {(r.stderr or '').strip()}")
+                rc = 1
+                ok = False
+        if ok:
+            print(f" ✔ Container {cname}  {done_word[verbs[-1]]}")
+            touched.append(cname)
+    if verbs[-1] == "start" and touched:
+        inject_hosts(proj, touched)
+    sys.exit(rc)
+
+
+def cmd_restart(proj, args):
+    services = [a for a in args if not a.startswith("-")]
+    selected = proj.named_services(services)
+    state = list_state()
+    touched = []
+    for svc in proj.topo_order(selected):
+        cname = proj.container_name(svc)
+        if cname not in state:
+            continue
+        run_cli(["stop", cname], capture_output=True)
+        r = run_cli(["start", cname], capture_output=True, text=True)
+        if r.returncode != 0:
+            warn(f"restart {cname}: {(r.stderr or '').strip()}")
+        else:
+            print(f" ✔ Container {cname}  Restarted")
+            touched.append(cname)
+    if touched:
+        inject_hosts(proj, touched)
+
+
+def cmd_pull(proj, args):
+    services = [a for a in args if not a.startswith("-")]
+    docker_shim = os.path.join(os.path.dirname(os.path.realpath(__file__)), "docker")
+    rc = 0
+    for svc in sorted(proj.named_services(services)):
+        cfg = proj.services[svc]
+        image = cfg.get("image")
+        if not image:
+            continue
+        print(f"Pulling {svc} ({image})...")
+        rc = subprocess.run([sys.executable, docker_shim, "pull", image]).returncode or rc
+    sys.exit(rc)
+
+
+def do_build(proj, svc, image):
+    cfg = proj.services[svc]
+    b = cfg.get("build")
+    if b is None:
+        return False
+    if isinstance(b, str):
+        b = {"context": b}
+    ctx = os.path.abspath(os.path.join(proj.dir, b.get("context", ".")))
+    argv = ["build", "--tag", image]
+    if b.get("dockerfile"):
+        argv += ["--file", os.path.join(ctx, b["dockerfile"])]
+    bargs = b.get("args") or {}
+    if isinstance(bargs, list):
+        for a in bargs:
+            argv += ["--build-arg", str(a)]
+    else:
+        for k, v in bargs.items():
+            argv += ["--build-arg", f"{k}={as_str(v)}"]
+    if b.get("target"):
+        argv += ["--target", b["target"]]
+    argv.append(ctx)
+    print(f"Building {svc}...")
+    r = run_cli(argv)
+    if r.returncode != 0:
+        die(f"build failed for service {svc}")
+    return True
+
+
+def cmd_build(proj, args):
+    services = [a for a in args if not a.startswith("-")]
+    built = 0
+    for svc in sorted(proj.named_services(services)):
+        image = proj.services[svc].get("image") or f"{proj.name}-{svc}"
+        if do_build(proj, svc, image):
+            built += 1
+    if not built:
+        warn("no services with a 'build:' section")
+
+
+def cmd_exec(proj, args):
+    flags = []
+    service = None
+    command = []
+    no_tty = False
+    detach = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if service is not None:
+            command = args[i:]
+            break
+        if a in ("-d", "--detach"):
+            detach = True
+            flags.append("--detach")
+        elif a in ("-e", "--env", "-u", "--user", "-w", "--workdir"):
+            flags += [a if a.startswith("--") else
+                      {"-e": "--env", "-u": "--user", "-w": "--workdir"}[a],
+                      args[i + 1]]
+            i += 1
+        elif a in ("-T", "--no-TTY"):
+            no_tty = True
+        elif a == "--index":
+            i += 1
+            if args[i] != "1":
+                warn("--index > 1 not supported (single instance per service)")
+        elif a == "--privileged":
+            warn("--privileged not supported; ignored")
+        elif a.startswith("-"):
+            warn(f"ignoring unsupported 'exec' option {a}")
+        else:
+            service = a
+        i += 1
+    if not service or not command:
+        die("usage: docker compose exec [options] SERVICE COMMAND [ARGS...]")
+    if service not in proj.services:
+        die(f"no such service: {service}")
+    if not detach and not no_tty and sys.stdin.isatty():
+        flags = ["--interactive", "--tty", *flags]
+    exec_cli(["exec", *flags, proj.container_name(service), *command])
+
+
+def cmd_run(proj, args):
+    remove = True
+    detach = False
+    no_deps = False
+    service_ports = False
+    extra = []
+    service = None
+    command = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if service is not None:
+            command = args[i:]
+            break
+        if a == "--rm":
+            pass
+        elif a in ("-d", "--detach"):
+            detach = True
+        elif a == "--no-deps":
+            no_deps = True
+        elif a == "--service-ports":
+            service_ports = True
+        elif a in ("-e", "--env", "-u", "--user", "-w", "--workdir",
+                   "--entrypoint", "--name"):
+            key = {"-e": "--env", "-u": "--user", "-w": "--workdir"}.get(a, a)
+            extra += [key, args[i + 1]]
+            i += 1
+        elif a in ("-T", "--no-TTY", "-i", "--interactive", "--build"):
+            pass
+        elif a.startswith("-"):
+            warn(f"ignoring unsupported 'run' option {a}")
+        else:
+            service = a
+        i += 1
+    if not service:
+        die("usage: docker compose run [options] SERVICE [COMMAND] [ARGS...]")
+    if service not in proj.services:
+        die(f"no such service: {service}")
+
+    deps = proj.closure([service]) - {service}
+    if deps and not no_deps:
+        bring_up(proj, deps)
+
+    run_args, image, tail = service_run_args(proj, service)
+    # one-off container: unique name, no published ports unless asked
+    if "--name" not in extra:
+        rname = f"{proj.name}-{service}-run-{os.getpid()}"
+    else:
+        rname = extra[extra.index("--name") + 1]
+    cleaned = []
+    skip_next = False
+    for j, tok in enumerate(run_args):
+        if skip_next:
+            skip_next = False
+            continue
+        if tok == "--name":
+            skip_next = True
+        elif tok == "--publish" and not service_ports:
+            skip_next = True
+        else:
+            cleaned.append(tok)
+    cleaned += ["--name", rname]
+    cleaned += extra
+    if remove:
+        cleaned.append("--rm")
+    if detach:
+        cleaned.append("--detach")
+    elif sys.stdin.isatty():
+        cleaned += ["--interactive", "--tty"]
+    if command:
+        tail = command
+    if "build" in proj.services[service] and not image_exists(image):
+        do_build(proj, service, image)
+    ensure_infra(proj, {service})
+
+    if detach:
+        r = run_cli(["run", *cleaned, image, *tail], capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"failed to run {service}: {(r.stderr or '').strip()}")
+        inject_hosts(proj, [rname])
+        print(rname)
+        return
+
+    # Attached one-off: there is no post-start hook, so service discovery is
+    # bootstrapped by wrapping the command in a shell that fills /etc/hosts
+    # first. Only possible with an explicit command and no custom entrypoint.
+    entries = hosts_entries(proj)
+    has_entrypoint = proj.services[service].get("entrypoint") is not None \
+        or "--entrypoint" in extra
+    if entries and tail and not has_entrypoint:
+        block = "\n".join(entries)
+        script = (f"printf '%s\\n' {shlex.quote(block)} >> /etc/hosts 2>/dev/null; "
+                  f"exec {shlex.join(str(t) for t in tail)}")
+        exec_cli(["run", *cleaned, "--entrypoint", "/bin/sh", image, "-c", script])
+    else:
+        if entries:
+            warn("service discovery is unavailable in this one-off container "
+                 "(custom entrypoint or no explicit command)")
+        exec_cli(["run", *cleaned, image, *tail])
+
+
+def cmd_config(proj, args):
+    if any(a in ("-q", "--quiet") for a in args):
+        return
+    if "--services" in args:
+        print("\n".join(sorted(proj.services)))
+        return
+    if "--volumes" in args:
+        print("\n".join(sorted(proj.top_volumes)))
+        return
+    print(json.dumps(proj.model, indent=2, ensure_ascii=False))
+
+
+HELP = f"""compose-shim {SHIM_VERSION} — docker compose subset for Apple container
+
+Usage: docker compose [-f FILE] [-p PROJECT] [--env-file FILE] COMMAND [ARGS...]
+
+Commands:
+  up [-d] [--build] [--force-recreate] [SERVICE...]
+  down [-v]
+  ps [-q] [SERVICE...]
+  logs [-f] [--tail N] [SERVICE...]
+  start / stop / restart / kill / rm [SERVICE...]
+  pull / build [SERVICE...]
+  exec [-T] [-e K=V] [-u USER] [-w DIR] SERVICE COMMAND...
+  run [--rm] [--no-deps] [--service-ports] SERVICE [COMMAND...]
+  config [--services | --volumes]
+  version
+
+Service discovery: after 'up', every service's IP is written to /etc/hosts of
+all project containers, so services reach each other by service name.
+Not supported: restart policies, healthchecks, scale>1, port ranges, profiles.
+"""
+
+
+def main(argv):
+    args = list(argv[1:])
+    opts = {"files": []}
+    while args:
+        a = args[0]
+        if a in ("-f", "--file"):
+            args.pop(0)
+            opts["files"].append(args.pop(0) if args else die("-f needs a value"))
+        elif a.startswith("--file="):
+            opts["files"].append(args.pop(0).split("=", 1)[1])
+        elif a in ("-p", "--project-name"):
+            args.pop(0)
+            opts["project_name"] = args.pop(0) if args else die("-p needs a value")
+        elif a.startswith("--project-name="):
+            opts["project_name"] = args.pop(0).split("=", 1)[1]
+        elif a == "--env-file":
+            args.pop(0)
+            opts["env_file"] = args.pop(0) if args else die("--env-file needs a value")
+        elif a == "--project-directory":
+            args.pop(0)
+            opts["project_directory"] = args.pop(0)
+        elif a in ("--profile", "--progress", "--ansi"):
+            args.pop(0)
+            if args:
+                args.pop(0)
+        elif a in ("-h", "--help"):
+            print(HELP)
+            return
+        elif a in ("-v", "--version", "version"):
+            print(f"Docker Compose shim {SHIM_VERSION} (Apple container backend)")
+            return
+        elif a.startswith("-"):
+            warn(f"ignoring unsupported global option {a}")
+            args.pop(0)
+        else:
+            break
+    if not args:
+        print(HELP)
+        return
+
+    cmd = args.pop(0)
+    if cmd == "version":
+        print(f"Docker Compose shim {SHIM_VERSION} (Apple container backend)")
+        return
+    if cmd == "help":
+        print(HELP)
+        return
+
+    proj = Project(opts)
+
+    commands = {
+        "up": cmd_up,
+        "down": cmd_down,
+        "ps": cmd_ps,
+        "logs": cmd_logs,
+        "start": lambda p, a: _simple_lifecycle(p, a, ["start"]),
+        "stop": lambda p, a: _simple_lifecycle(p, a, ["stop"]),
+        "kill": lambda p, a: _simple_lifecycle(p, a, ["kill"]),
+        "rm": lambda p, a: _simple_lifecycle(p, a, ["stop", "delete"]),
+        "restart": cmd_restart,
+        "pull": cmd_pull,
+        "build": cmd_build,
+        "exec": cmd_exec,
+        "run": cmd_run,
+        "config": cmd_config,
+    }
+    handler = commands.get(cmd)
+    if handler is None:
+        die(f"'docker compose {cmd}' is not supported by compose-shim "
+            "(run 'docker compose --help' for the supported subset)")
+    handler(proj, args)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

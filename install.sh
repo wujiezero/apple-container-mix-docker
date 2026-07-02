@@ -21,16 +21,20 @@ command -v container >/dev/null 2>&1 || fail \
     "Apple 'container' CLI not found. Install it first: https://github.com/apple/container/releases"
 command -v python3 >/dev/null 2>&1 || fail "python3 not found on PATH"
 
-# --- 1. symlink -------------------------------------------------------------
-chmod +x "$SHIM"
+# --- 1. symlinks --------------------------------------------------------------
+COMPOSE_SHIM="$SCRIPT_DIR/bin/docker-compose"
+chmod +x "$SHIM" "$COMPOSE_SHIM"
 mkdir -p "$TARGET_DIR" 2>/dev/null || sudo mkdir -p "$TARGET_DIR"
 if [ -w "$TARGET_DIR" ]; then
     ln -sf "$SHIM" "$TARGET_DIR/docker"
+    ln -sf "$COMPOSE_SHIM" "$TARGET_DIR/docker-compose"
 else
     say "$TARGET_DIR is not writable, using sudo"
     sudo ln -sf "$SHIM" "$TARGET_DIR/docker"
+    sudo ln -sf "$COMPOSE_SHIM" "$TARGET_DIR/docker-compose"
 fi
 say "installed: $TARGET_DIR/docker -> $SHIM"
+say "installed: $TARGET_DIR/docker-compose -> $COMPOSE_SHIM"
 
 # --- 2. PATH check ----------------------------------------------------------
 case ":$PATH:" in

@@ -71,11 +71,49 @@ container/image/network(/volume) prune with a confirmation prompt.
 | Auth | login, logout |
 | Groups | `docker container/image/volume/network/system ...` subcommands |
 | Cleanup | `docker system prune` (+ per-group prune, with confirmation unless `-f`) |
+| Compose | `docker compose` / `docker-compose` — see the section below |
 | Misc | version, info |
 
 Explicitly **unsupported** (clear error + suggested alternative): attach,
-commit, pause/unpause, top, port, wait, events, history, swarm, context,
-compose — apple/container 1.0.0 has no equivalent capability.
+commit, pause/unpause, top, port, wait, events, history, swarm, context —
+apple/container 1.0.0 has no equivalent capability.
+
+## docker compose
+
+`docker compose` (and the v1-style `docker-compose` binary) is implemented by
+`bin/docker-compose`, which translates a compose file into individual
+`container` calls:
+
+```bash
+docker compose up -d          # also: --build, --force-recreate, [SERVICE...]
+docker compose ps / logs -f / exec SERVICE CMD / run --rm SERVICE CMD
+docker compose stop / start / restart / down [-v]
+docker compose pull / build / config
+```
+
+Supported service keys: `image`, `build` (context/dockerfile/args/target),
+`container_name`, `command`, `entrypoint`, `environment`, `env_file`, `ports`,
+`volumes` (bind mounts, named volumes, tmpfs, `:ro`), `networks`, `depends_on`
+(start ordering), `labels`, `user`, `working_dir`, `platform`, `tty`,
+`stdin_open`, `cap_add/drop`, `dns`, `tmpfs`, `shm_size`, `ulimits`, `cpus`,
+`mem_limit`, `extra_hosts`, `read_only`, `init`. Variable interpolation
+(`${VAR:-default}`) and `.env` files work; YAML parsing uses PyYAML when
+available and falls back to macOS's bundled Ruby (zero install).
+
+Details worth knowing:
+
+- **Service discovery**: Apple container has no usable DNS for bare names, so
+  after `up` the shim writes every service's IP into `/etc/hosts` of all
+  project containers — services reach each other by service name as usual.
+  This requires `/bin/sh` in the image; IPs are re-written by
+  `up`/`start`/`restart`.
+- Project resources are namespaced like compose: containers
+  `<project>-<service>-1`, network `<project>_default`, volumes
+  `<project>_<name>`.
+- Not supported (warned and ignored): `restart:` policies, `healthcheck`,
+  `deploy.replicas`/scale > 1, port ranges, host/container-only port syntax,
+  multiple networks per service (first one is used), profiles, secrets,
+  configs.
 
 ## Known semantic differences
 

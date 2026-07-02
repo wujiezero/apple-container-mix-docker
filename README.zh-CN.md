@@ -67,11 +67,44 @@ prune 并先确认。
 | 登录 | login, logout |
 | 分组 | `docker container/image/volume/network/system ...` 二级子命令 |
 | 清理 | `docker system prune`（及各分组 prune，无 `-f` 时先确认） |
+| Compose | `docker compose` / `docker-compose`——见下方章节 |
 | 其他 | version, info |
 
 明确**不支持**（会给出明确报错和替代建议）：attach, commit, pause/unpause,
-top, port, wait, events, history, swarm, context, compose——这些在
+top, port, wait, events, history, swarm, context——这些在
 apple/container 1.0.0 中没有对应能力。
+
+## docker compose
+
+`docker compose`（以及 v1 风格的 `docker-compose` 命令）由
+`bin/docker-compose` 实现，把 compose 文件翻译成一组 `container` 调用：
+
+```bash
+docker compose up -d          # 支持 --build、--force-recreate、[SERVICE...]
+docker compose ps / logs -f / exec SERVICE CMD / run --rm SERVICE CMD
+docker compose stop / start / restart / down [-v]
+docker compose pull / build / config
+```
+
+支持的 service 配置项：`image`、`build`（context/dockerfile/args/target）、
+`container_name`、`command`、`entrypoint`、`environment`、`env_file`、
+`ports`、`volumes`（bind 挂载、具名卷、tmpfs、`:ro`）、`networks`、
+`depends_on`（启动顺序）、`labels`、`user`、`working_dir`、`platform`、
+`tty`、`stdin_open`、`cap_add/drop`、`dns`、`tmpfs`、`shm_size`、`ulimits`、
+`cpus`、`mem_limit`、`extra_hosts`、`read_only`、`init`。变量插值
+（`${VAR:-default}`）和 `.env` 文件可用；YAML 解析优先用 PyYAML，没装则
+自动退回 macOS 自带的 Ruby（零安装依赖）。
+
+需要了解的实现细节：
+
+- **服务发现**：Apple container 没有可用的裸名 DNS，shim 在 `up` 之后把每个
+  服务的 IP 写进项目内所有容器的 `/etc/hosts`——服务间照常用服务名互访。
+  要求镜像内有 `/bin/sh`；`up`/`start`/`restart` 时会重写 IP。
+- 资源命名与 compose 一致：容器 `<项目>-<服务>-1`、网络 `<项目>_default`、
+  卷 `<项目>_<卷名>`。
+- 不支持（告警后忽略）：`restart:` 策略、`healthcheck`、
+  `deploy.replicas`/scale > 1、端口区间、无宿主机端口的随机端口语法、
+  单服务多网络（只挂第一个）、profiles、secrets、configs。
 
 ## 已知语义差异
 

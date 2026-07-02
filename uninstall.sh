@@ -9,7 +9,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SHIM="$SCRIPT_DIR/bin/docker"
 
 say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 note() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -26,17 +25,21 @@ done
 
 REMOVED=0
 for dir in "${DIRS[@]}"; do
-    LINK="$dir/docker"
-    [ -L "$LINK" ] || continue
-    if [ "$(readlink "$LINK")" = "$SHIM" ]; then
-        if [ -w "$dir" ]; then
-            rm "$LINK"
-        else
-            sudo rm "$LINK"
-        fi
-        say "removed: $LINK"
-        REMOVED=1
-    fi
+    for name in docker docker-compose; do
+        LINK="$dir/$name"
+        [ -L "$LINK" ] || continue
+        case "$(readlink "$LINK")" in
+            "$SCRIPT_DIR/bin/"*)
+                if [ -w "$dir" ]; then
+                    rm "$LINK"
+                else
+                    sudo rm "$LINK"
+                fi
+                say "removed: $LINK"
+                REMOVED=1
+                ;;
+        esac
+    done
 done
 [ "$REMOVED" = 1 ] || note "no shim symlink found (nothing removed)"
 

@@ -15,7 +15,7 @@ import shlex
 import subprocess
 import sys
 
-SHIM_VERSION = "0.2.0"
+SHIM_VERSION = "0.3.0"
 CONTAINER_BIN = os.environ.get("DOCKER_SHIM_CONTAINER_BIN", "container")
 DEBUG = os.environ.get("DOCKER_SHIM_DEBUG", "") not in ("", "0")
 STRICT = os.environ.get("DOCKER_SHIM_STRICT", "") not in ("", "0")
@@ -651,7 +651,7 @@ Usage: docker COMMAND [ARGS...]
 Translated commands:
   run, create, exec, ps, start, stop, restart*, kill, rm, logs, cp, stats,
   inspect, export, pull, push, images, rmi, tag, save, load, build,
-  login, logout, version, info
+  login, logout, version, info, compose (see 'docker compose --help')
   image / container / volume / network / system subcommand groups
 
 * restart is emulated as stop + start.
@@ -718,9 +718,18 @@ HANDLERS = {
     "swarm":   cmd_unsupported("swarm"),
     "context": cmd_unsupported("context"),
     "manifest": cmd_unsupported("manifest"),
-    "compose": cmd_unsupported("compose", "Apple container has no compose support; "
-                               "run services individually with 'docker run'"),
 }
+
+
+def cmd_compose(rest):
+    script = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                          "docker-compose")
+    if DEBUG:
+        print(f"docker-shim: exec: {shlex.join([script, *rest])}", file=sys.stderr)
+    os.execv(sys.executable, [sys.executable, script, *rest])
+
+
+HANDLERS["compose"] = cmd_compose
 
 CONTAINER_GROUP = {
     "ls": "ps", "list": "ps", "ps": "ps",
@@ -814,6 +823,10 @@ GLOBAL_VALUE_OPTS = ("-H", "--host", "--context", "-c", "--config",
 
 def main(argv):
     args = list(argv[1:])
+
+    # `docker-compose ...` (v1-style binary) routes to the compose shim
+    if os.path.basename(argv[0]).startswith("docker-compose"):
+        cmd_compose(args)
 
     while args:
         tok = args[0]
