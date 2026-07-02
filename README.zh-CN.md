@@ -117,6 +117,46 @@ docker compose pull / build / config
   但没有 host 网络模式。
 - `--restart` 策略、healthcheck、cgroup 细粒度资源限制不生效（被丢弃）。
 - `ps --format` / `inspect --format` 只支持 `json`，不支持 Go template。
+- 容器内对 bind mount 的**挂载点本身**做 `chmod`/`chown` 会被 virtiofs 拒绝
+  （挂载点里面的子目录和文件完全正常）——数据库镜像会因此起不来，见下节。
+
+### 数据库镜像与 bind mount（postgres、mysql 等）
+
+官方数据库镜像的 entrypoint 启动时会对数据目录 `chown`。而 Apple container
+的 bind mount 挂载点拒绝 `chmod`/`chown`（`Operation not permitted`，是
+virtiofs 的限制，和目录归属无关），所以这样写会启动失败：
+
+```bash
+docker run -d -v ~/Documents/Docker/pg16:/var/lib/postgresql/data postgres:16-bookworm   # 失败
+```
+
+绕法一（推荐）：让真正的数据目录是**挂载点内的子目录**——挂载点里新建的
+inode 可以随便 chown。以 postgres 为例，挂载父目录、用 `PGDATA` 指到里面：
+
+```bash
+docker run -d --name pg16 \
+  -e PGDATA=/pg/data \
+  -v ~/Documents/Docker/pg16:/pg \
+  postgres:16-bookworm
+```
+
+```yaml
+services:
+  db:
+    image: postgres:16-bookworm
+    environment:
+      PGDATA: /pg/data
+    volumes:
+      - ./pgdata:/pg
+```
+
+数据路径可配置的镜像同理（MySQL 的 `--datadir`、MongoDB 的 `--dbpath` 等）。
+
+绕法二：用宿主机当前用户运行（`--user $(id -u):$(id -g)`，且挂载目录归属
+该用户），跳过 entrypoint 的 chown 分支。
+
+具名卷（`docker volume create` / compose 顶层 `volumes:`）不受此限制——
+不需要在宿主机直接看文件时优先用具名卷。
 
 ## 调试
 

@@ -126,6 +126,50 @@ Details worth knowing:
   `-p` port publishing works, but there is no host network mode.
 - `--restart` policies, healthchecks and fine-grained cgroup limits are dropped.
 - `ps --format` / `inspect --format` only accept `json`, not Go templates.
+- `chmod`/`chown` on a bind mount's **mount point itself** is denied by
+  virtiofs (subdirectories and files inside it work normally) — this breaks
+  database images at startup, see below.
+
+### Database images and bind mounts (postgres, mysql, ...)
+
+Official database images `chown` their data directory in the entrypoint. With
+Apple container, a bind mount's mount point rejects `chmod`/`chown`
+(`Operation not permitted` — a virtiofs restriction, regardless of ownership),
+so this fails at startup:
+
+```bash
+docker run -d -v ~/Documents/Docker/pg16:/var/lib/postgresql/data postgres:16-bookworm   # FAILS
+```
+
+Workaround 1 (preferred): make the real data directory a **subdirectory of
+the mount** — new inodes created inside the mount can be chown'd freely. For
+postgres, mount the parent and point `PGDATA` inside it:
+
+```bash
+docker run -d --name pg16 \
+  -e PGDATA=/pg/data \
+  -v ~/Documents/Docker/pg16:/pg \
+  postgres:16-bookworm
+```
+
+```yaml
+services:
+  db:
+    image: postgres:16-bookworm
+    environment:
+      PGDATA: /pg/data
+    volumes:
+      - ./pgdata:/pg
+```
+
+The same idea works for any image whose data path is configurable
+(MySQL `--datadir`, MongoDB `--dbpath`, ...).
+
+Workaround 2: skip the entrypoint's chown branch by running as your host user
+(`--user $(id -u):$(id -g)`), with the host directory owned by that user.
+
+Named volumes (`docker volume create` / compose top-level `volumes:`) are not
+affected — prefer them when you don't need the files visible on the host.
 
 ## Debugging
 
