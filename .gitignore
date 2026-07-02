@@ -1,0 +1,10 @@
+# local collaboration notes (contains machine-specific details)
+.claude/
+
+.DS_Store
+*.bak
+__pycache__/
+
+# bin/ holds the shim itself, not build output — override the global gitignore
+!bin/
+!bin/**

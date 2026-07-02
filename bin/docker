@@ -1,0 +1,842 @@
+#!/usr/bin/env python3
+"""
+docker-shim: translate Docker CLI invocations into Apple `container` CLI calls.
+
+Targets apple/container 1.0.0 (https://github.com/apple/container).
+
+Environment variables:
+  DOCKER_SHIM_DEBUG=1          print the translated command before running it
+  DOCKER_SHIM_STRICT=1         fail on unsupported flags instead of dropping them
+  DOCKER_SHIM_CONTAINER_BIN    path to the `container` binary (default: container)
+"""
+
+import os
+import shlex
+import subprocess
+import sys
+
+SHIM_VERSION = "0.1.0"
+CONTAINER_BIN = os.environ.get("DOCKER_SHIM_CONTAINER_BIN", "container")
+DEBUG = os.environ.get("DOCKER_SHIM_DEBUG", "") not in ("", "0")
+STRICT = os.environ.get("DOCKER_SHIM_STRICT", "") not in ("", "0")
+
+# Sentinels for flag translation targets.
+DROP = "!drop"      # unsupported: warn (or fail in strict mode) and discard
+SILENT = "!silent"  # meaningless here but harmless: discard quietly
+
+GLOBAL_FLAGS = []   # e.g. --debug, inserted right after the container binary
+
+
+def warn(msg):
+    print(f"docker-shim: warning: {msg}", file=sys.stderr)
+
+
+def die(msg, code=1):
+    print(f"docker-shim: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def execute(argv):
+    """Replace this process with the container CLI (keeps TTY/signals/exit code)."""
+    if DEBUG:
+        print(f"docker-shim: exec: {shlex.join(argv)}", file=sys.stderr)
+    try:
+        os.execvp(argv[0], argv)
+    except FileNotFoundError:
+        die(f"'{argv[0]}' not found — is Apple container installed? "
+            "(https://github.com/apple/container)")
+
+
+def run_sub(argv, **kwargs):
+    """Run a container CLI call as a subprocess (for multi-step emulations)."""
+    if DEBUG:
+        print(f"docker-shim: run: {shlex.join(argv)}", file=sys.stderr)
+    try:
+        return subprocess.run(argv, **kwargs).returncode
+    except FileNotFoundError:
+        die(f"'{argv[0]}' not found — is Apple container installed?")
+
+
+def emit(target):
+    return target if isinstance(target, list) else [target]
+
+
+def handle_target(name, cmd_name, target, out_flags, value=None):
+    """Append the translated flag (and value) to out_flags per its target."""
+    if target == DROP:
+        detail = f" (value {value!r})" if value is not None else ""
+        msg = f"'{cmd_name}' does not support {name}{detail} on Apple container; dropping it"
+        if STRICT:
+            die(msg)
+        warn(msg)
+    elif target == SILENT:
+        pass
+    elif callable(target):
+        out_flags.extend(target(value))
+    elif value is not None:
+        out_flags.extend(emit(target) + [value])
+    else:
+        out_flags.extend(emit(target))
+
+
+def translate(args, spec, cmd_name):
+    """Split docker-style args into (translated_flags, positionals, frozen_tail).
+
+    spec = {"bool": {...}, "value": {...}, "stop_after": N}
+    After `stop_after` positionals, remaining args are frozen verbatim
+    (docker semantics: flags after the image/container go to the process).
+    """
+    boolmap = spec.get("bool", {})
+    valmap = spec.get("value", {})
+    stop_after = spec.get("stop_after")
+    out_flags, positionals, frozen = [], [], []
+
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if stop_after is not None and len(positionals) >= stop_after:
+            frozen = args[i:]
+            break
+        if tok == "--":
+            frozen = args[i + 1:]
+            break
+        if tok in ("-h", "--help") and "-h" not in valmap:
+            out_flags.append("--help")
+        elif tok.startswith("--"):
+            name, eq, val = tok.partition("=")
+            if name in boolmap:
+                if eq:
+                    die(f"option {name} does not take a value")
+                handle_target(name, cmd_name, boolmap[name], out_flags)
+            elif name in valmap:
+                if not eq:
+                    i += 1
+                    if i >= len(args):
+                        die(f"option {name} requires a value")
+                    val = args[i]
+                handle_target(name, cmd_name, valmap[name], out_flags, val)
+            else:
+                unknown_flag(name, cmd_name, eq == "=")
+        elif tok.startswith("-") and tok != "-":
+            # short flag cluster, e.g. -itd, -p8080:80
+            j = 1
+            while j < len(tok):
+                f = "-" + tok[j]
+                if f in boolmap:
+                    handle_target(f, cmd_name, boolmap[f], out_flags)
+                    j += 1
+                elif f in valmap:
+                    rest = tok[j + 1:]
+                    if rest:
+                        val = rest
+                    else:
+                        i += 1
+                        if i >= len(args):
+                            die(f"option {f} requires a value")
+                        val = args[i]
+                    handle_target(f, cmd_name, valmap[f], out_flags, val)
+                    break
+                else:
+                    unknown_flag(f, cmd_name, False)
+                    j += 1
+        else:
+            positionals.append(tok)
+        i += 1
+    return out_flags, positionals, frozen
+
+
+def unknown_flag(name, cmd_name, had_inline_value):
+    msg = f"unknown option {name} for '{cmd_name}'; dropping it"
+    if STRICT:
+        die(msg)
+    warn(msg + ("" if had_inline_value else
+                " (if it takes a separate value, that value may be misparsed)"))
+
+
+# ---------------------------------------------------------------------------
+# value-flag callables
+
+def fmt_json(val):
+    if val.strip() in ("json", "{{json .}}"):
+        return ["--format", "json"]
+    warn("Go-template --format values are not supported; using default table output")
+    return []
+
+
+def map_network(val):
+    base = val.split(",")[0]
+    if base == "bridge":
+        return ["--network", "default"]
+    if base in ("host", "none"):
+        warn(f"network mode '{base}' is not supported by Apple container; "
+             "using the default network")
+        return []
+    return ["--network", val]
+
+
+def quiet_progress(_val=None):
+    return ["--progress", "none"]
+
+
+# ---------------------------------------------------------------------------
+# per-command flag specs
+
+RUN_SPEC = {
+    "stop_after": 1,
+    "bool": {
+        "-d": "--detach", "--detach": "--detach",
+        "-i": "--interactive", "--interactive": "--interactive",
+        "-t": "--tty", "--tty": "--tty",
+        "--rm": "--rm",
+        "--init": "--init",
+        "--read-only": "--read-only",
+        "--privileged": DROP,
+        "-P": DROP, "--publish-all": DROP,
+        "--no-healthcheck": SILENT,
+        "--oom-kill-disable": DROP,
+        "--sig-proxy": SILENT,
+        "--help": "--help",
+    },
+    "value": {
+        "-e": "--env", "--env": "--env",
+        "--env-file": "--env-file",
+        "-u": "--user", "--user": "--user",
+        "-w": "--workdir", "--workdir": "--workdir",
+        "-v": "--volume", "--volume": "--volume",
+        "--mount": "--mount",
+        "--tmpfs": "--tmpfs",
+        "--name": "--name",
+        "--network": map_network, "--net": map_network,
+        "-p": "--publish", "--publish": "--publish",
+        "--entrypoint": "--entrypoint",
+        "-l": "--label", "--label": "--label",
+        "--cpus": "--cpus",
+        "-m": "--memory", "--memory": "--memory",
+        "--shm-size": "--shm-size",
+        "--platform": "--platform",
+        "--cidfile": "--cidfile",
+        "--ulimit": "--ulimit",
+        "--dns": "--dns",
+        "--dns-search": "--dns-search",
+        "--dns-option": "--dns-option", "--dns-opt": "--dns-option",
+        "--cap-add": "--cap-add", "--cap-drop": "--cap-drop",
+        "--runtime": "--runtime",
+        # docker-only options with no Apple container equivalent:
+        "--restart": DROP,
+        "-h": DROP, "--hostname": DROP,
+        "--add-host": DROP,
+        "--expose": DROP,
+        "--gpus": DROP,
+        "--device": DROP,
+        "--ipc": DROP, "--pid": DROP, "--uts": DROP,
+        "--security-opt": DROP,
+        "--log-driver": DROP, "--log-opt": DROP,
+        "--label-file": DROP,
+        "--health-cmd": DROP, "--health-interval": DROP, "--health-retries": DROP,
+        "--health-timeout": DROP, "--health-start-period": DROP,
+        "--stop-signal": DROP, "--stop-timeout": DROP,
+        "--memory-swap": DROP, "--memory-reservation": DROP,
+        "--memory-swappiness": DROP, "--kernel-memory": DROP,
+        "--cpu-shares": DROP, "--cpu-period": DROP, "--cpu-quota": DROP,
+        "--cpuset-cpus": DROP, "--cpuset-mems": DROP,
+        "--blkio-weight": DROP, "--pids-limit": DROP,
+        "--userns": DROP, "--group-add": DROP,
+        "--link": DROP, "--ip": DROP, "--ip6": DROP, "--mac-address": DROP,
+        "-a": DROP, "--attach": DROP,
+        "--detach-keys": DROP,
+        "--isolation": DROP, "--storage-opt": DROP, "--sysctl": DROP,
+        "--volumes-from": DROP, "--volume-driver": DROP,
+        "--pull": DROP,
+        "--domainname": DROP,
+    },
+}
+
+EXEC_SPEC = {
+    "stop_after": 1,
+    "bool": {
+        "-d": "--detach", "--detach": "--detach",
+        "-i": "--interactive", "--interactive": "--interactive",
+        "-t": "--tty", "--tty": "--tty",
+        "--privileged": DROP,
+        "--help": "--help",
+    },
+    "value": {
+        "-e": "--env", "--env": "--env",
+        "--env-file": "--env-file",
+        "-u": "--user", "--user": "--user",
+        "-w": "--workdir", "--workdir": "--workdir",
+        "--detach-keys": DROP,
+    },
+}
+
+PS_SPEC = {
+    "bool": {
+        "-a": "--all", "--all": "--all",
+        "-q": "--quiet", "--quiet": "--quiet",
+        "-l": DROP, "--latest": DROP,
+        "-s": DROP, "--size": DROP,
+        "--no-trunc": SILENT,
+    },
+    "value": {
+        "--format": fmt_json,
+        "-f": DROP, "--filter": DROP,
+        "-n": DROP, "--last": DROP,
+    },
+}
+
+IMAGES_SPEC = {
+    "bool": {
+        "-a": SILENT, "--all": SILENT,  # image list already shows everything
+        "-q": "--quiet", "--quiet": "--quiet",
+        "--digests": DROP,
+        "--no-trunc": SILENT,
+    },
+    "value": {
+        "--format": fmt_json,
+        "-f": DROP, "--filter": DROP,
+    },
+}
+
+PULL_SPEC = {
+    "bool": {
+        "-q": quiet_progress, "--quiet": quiet_progress,
+        "-a": DROP, "--all-tags": DROP,
+        "--disable-content-trust": SILENT,
+    },
+    "value": {"--platform": "--platform"},
+}
+
+PUSH_SPEC = {
+    "bool": {
+        "-q": quiet_progress, "--quiet": quiet_progress,
+        "-a": DROP, "--all-tags": DROP,
+        "--disable-content-trust": SILENT,
+    },
+    "value": {"--platform": "--platform"},
+}
+
+RMI_SPEC = {
+    "bool": {
+        "-f": "--force", "--force": "--force",
+        "--no-prune": SILENT,
+    },
+    "value": {},
+}
+
+BUILD_SPEC = {
+    "bool": {
+        "--no-cache": "--no-cache",
+        "--pull": "--pull",
+        "-q": "--quiet", "--quiet": "--quiet",
+        "--load": SILENT,   # built images land in the local store by default
+        "--push": DROP,
+        "--rm": SILENT, "--force-rm": SILENT,
+        "--compress": SILENT,
+    },
+    "value": {
+        "-t": "--tag", "--tag": "--tag",
+        "-f": "--file", "--file": "--file",
+        "--build-arg": "--build-arg",
+        "--platform": "--platform",
+        "--target": "--target",
+        "--label": "--label",
+        "--secret": "--secret",
+        "--progress": "--progress",
+        "-o": "--output", "--output": "--output",
+        "-m": "--memory", "--memory": "--memory",
+        "--network": DROP,
+        "--ssh": DROP,
+        "--cache-from": DROP, "--cache-to": DROP,
+        "--builder": DROP,
+        "--iidfile": DROP,
+        "--provenance": DROP, "--sbom": DROP,
+        "--add-host": DROP, "--shm-size": DROP, "--ulimit": DROP,
+        "--cpu-shares": DROP, "--cpuset-cpus": DROP,
+    },
+}
+
+LOGS_SPEC = {
+    "bool": {
+        "-f": "--follow", "--follow": "--follow",
+        "-t": DROP, "--timestamps": DROP,
+        "--details": SILENT,
+    },
+    "value": {
+        "--tail": "-n", "-n": "-n",
+        "--since": DROP, "--until": DROP,
+    },
+}
+
+STOP_SPEC = {
+    "bool": {},
+    "value": {
+        "-t": "--time", "--time": "--time",
+        "-s": "--signal", "--signal": "--signal",
+    },
+}
+
+START_SPEC = {
+    "bool": {
+        "-a": "--attach", "--attach": "--attach",
+        "-i": "--interactive", "--interactive": "--interactive",
+    },
+    "value": {"--detach-keys": DROP},
+}
+
+KILL_SPEC = {
+    "bool": {},
+    "value": {"-s": "--signal", "--signal": "--signal"},
+}
+
+RM_SPEC = {
+    "bool": {
+        "-f": "--force", "--force": "--force",
+        "-v": DROP, "--volumes": DROP,
+        "-l": DROP, "--link": DROP,
+    },
+    "value": {},
+}
+
+STATS_SPEC = {
+    "bool": {
+        "--no-stream": "--no-stream",
+        "-a": DROP, "--all": DROP,
+        "--no-trunc": SILENT,
+    },
+    "value": {"--format": fmt_json},
+}
+
+SAVE_SPEC = {
+    "bool": {},
+    "value": {"-o": "--output", "--output": "--output", "--platform": "--platform"},
+}
+
+LOAD_SPEC = {
+    "bool": {"-q": SILENT, "--quiet": SILENT},
+    "value": {"-i": "--input", "--input": "--input"},
+}
+
+EXPORT_SPEC = {
+    "bool": {},
+    "value": {"-o": "--output", "--output": "--output"},
+}
+
+CP_SPEC = {
+    "bool": {"-a": SILENT, "--archive": SILENT, "-L": DROP, "--follow-link": DROP},
+    "value": {},
+}
+
+NETWORK_CREATE_SPEC = {
+    "bool": {"--internal": "--internal"},
+    "value": {
+        "--subnet": "--subnet",
+        "--label": "--label",
+        "-o": "--option", "--opt": "--option",
+        "-d": DROP, "--driver": DROP,
+        "--gateway": DROP, "--ip-range": DROP,
+    },
+}
+
+VOLUME_CREATE_SPEC = {
+    "bool": {},
+    "value": {
+        "--label": "--label",
+        "-o": "--opt", "--opt": "--opt",
+        "-d": SILENT, "--driver": SILENT,
+    },
+}
+
+EMPTY_SPEC = {"bool": {}, "value": {}}
+
+
+# ---------------------------------------------------------------------------
+# handlers
+
+def run_generic(target, spec, name, rest, drop_positionals=False):
+    flags, pos, frozen = translate(rest, spec, name)
+    if drop_positionals and (pos or frozen):
+        warn(f"'{name}' does not accept name filters on Apple container; "
+             f"ignoring {pos + frozen}")
+        pos, frozen = [], []
+    execute([CONTAINER_BIN, *GLOBAL_FLAGS, *target, *flags, *pos, *frozen])
+
+
+def cmd_restart(rest):
+    flags, pos, frozen = translate(rest, STOP_SPEC, "restart")
+    ids = pos + frozen
+    if not ids:
+        die("'restart' requires at least one container")
+    # Emulated: Apple container has no restart. Stop (ignore failures for
+    # already-stopped containers), then start each one.
+    run_sub([CONTAINER_BIN, *GLOBAL_FLAGS, "stop", *flags, *ids])
+    rc = 0
+    for cid in ids:
+        rc = run_sub([CONTAINER_BIN, *GLOBAL_FLAGS, "start", cid]) or rc
+    sys.exit(rc)
+
+
+def cmd_inspect(rest):
+    kinds = ["container", "image"]
+    ids = []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok in ("-f", "--format") or tok.startswith("--format="):
+            if "=" not in tok:
+                i += 1
+            warn("'inspect --format' templates are not supported; printing full JSON")
+        elif tok in ("--type",) or tok.startswith("--type="):
+            val = tok.partition("=")[2]
+            if not val:
+                i += 1
+                val = rest[i] if i < len(rest) else ""
+            if val in ("container", "image"):
+                kinds = [val]
+        elif tok in ("-s", "--size"):
+            pass
+        elif tok in ("-h", "--help"):
+            execute([CONTAINER_BIN, "inspect", "--help"])
+        elif tok.startswith("-"):
+            warn(f"unknown option {tok} for 'inspect'; dropping it")
+        else:
+            ids.append(tok)
+        i += 1
+    if not ids:
+        die("'inspect' requires at least one container or image")
+    last = None
+    for kind in kinds:
+        argv = [CONTAINER_BIN, *GLOBAL_FLAGS]
+        argv += ["inspect"] if kind == "container" else ["image", "inspect"]
+        if DEBUG:
+            print(f"docker-shim: try: {shlex.join(argv + ids)}", file=sys.stderr)
+        last = subprocess.run(argv + ids, capture_output=True, text=True)
+        if last.returncode == 0:
+            sys.stdout.write(last.stdout)
+            sys.exit(0)
+    sys.stderr.write(last.stderr)
+    sys.exit(last.returncode)
+
+
+def cmd_login(rest):
+    user = password = server = None
+    pw_stdin = False
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        name, eq, val = tok.partition("=")
+        if name in ("-u", "--username"):
+            if not eq:
+                i += 1
+                val = rest[i] if i < len(rest) else die("--username requires a value")
+            user = val
+        elif name in ("-p", "--password"):
+            if not eq:
+                i += 1
+                val = rest[i] if i < len(rest) else die("--password requires a value")
+            password = val
+        elif tok == "--password-stdin":
+            pw_stdin = True
+        elif tok in ("-h", "--help"):
+            execute([CONTAINER_BIN, "registry", "login", "--help"])
+        elif tok.startswith("-"):
+            warn(f"unknown option {tok} for 'login'; dropping it")
+        else:
+            server = tok
+        i += 1
+    argv = [CONTAINER_BIN, *GLOBAL_FLAGS, "registry", "login"]
+    if user:
+        argv += ["--username", user]
+    if password is not None or pw_stdin:
+        argv.append("--password-stdin")
+    argv.append(server or "docker.io")
+    if password is not None:
+        sys.exit(run_sub(argv, input=password.encode()))
+    execute(argv)
+
+
+def cmd_logout(rest):
+    server = next((t for t in rest if not t.startswith("-")), "docker.io")
+    execute([CONTAINER_BIN, *GLOBAL_FLAGS, "registry", "logout", server])
+
+
+def confirm_prune(rest, what):
+    forced = any(t in ("-f", "--force") for t in rest)
+    if not forced and sys.stdin.isatty():
+        try:
+            answer = input(f"WARNING! This will remove {what}.\nAre you sure? [y/N] ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            sys.exit(0)
+
+
+def cmd_system_prune(rest):
+    confirm_prune(rest, "all stopped containers, unused images and unused networks")
+    remove_all = any(t in ("-a", "--all") for t in rest)
+    steps = [["prune"], ["image", "prune"] + (["--all"] if remove_all else []),
+             ["network", "prune"]]
+    if "--volumes" in rest:
+        steps.append(["volume", "prune"])
+    rc = 0
+    for step in steps:
+        rc = run_sub([CONTAINER_BIN, *GLOBAL_FLAGS, *step]) or rc
+    sys.exit(rc)
+
+
+def cmd_container_prune(rest):
+    confirm_prune(rest, "all stopped containers")
+    execute([CONTAINER_BIN, *GLOBAL_FLAGS, "prune"])
+
+
+def cmd_image_prune(rest):
+    confirm_prune(rest, "unused images")
+    argv = [CONTAINER_BIN, *GLOBAL_FLAGS, "image", "prune"]
+    if any(t in ("-a", "--all") for t in rest):
+        argv.append("--all")
+    execute(argv)
+
+
+def cmd_network_prune(rest):
+    confirm_prune(rest, "unused networks")
+    execute([CONTAINER_BIN, *GLOBAL_FLAGS, "network", "prune"])
+
+
+def cmd_volume_prune(rest):
+    confirm_prune(rest, "unused volumes")
+    execute([CONTAINER_BIN, *GLOBAL_FLAGS, "volume", "prune"])
+
+
+def cmd_version(_rest):
+    print(f"Docker compatibility shim for Apple container (docker-shim {SHIM_VERSION})")
+    sys.stdout.flush()
+    execute([CONTAINER_BIN, "--version"])
+
+
+def cmd_unsupported(name, hint=""):
+    def h(_rest):
+        msg = f"'docker {name}' has no Apple container equivalent"
+        if hint:
+            msg += f"; {hint}"
+        die(msg)
+    return h
+
+
+HELP_TEXT = f"""docker-shim {SHIM_VERSION} — Docker CLI compatibility layer for Apple container
+
+Usage: docker COMMAND [ARGS...]
+
+Translated commands:
+  run, create, exec, ps, start, stop, restart*, kill, rm, logs, cp, stats,
+  inspect, export, pull, push, images, rmi, tag, save, load, build,
+  login, logout, version, info
+  image / container / volume / network / system subcommand groups
+
+* restart is emulated as stop + start.
+
+Everything is forwarded to the `container` CLI (apple/container).
+Unsupported docker flags are dropped with a warning (DOCKER_SHIM_STRICT=1 to fail).
+DOCKER_SHIM_DEBUG=1 prints each translated command.
+
+Run 'container --help' to see the native CLI.
+"""
+
+
+def print_help():
+    print(HELP_TEXT)
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# dispatch
+
+HANDLERS = {
+    "run":     lambda r: run_generic(["run"], RUN_SPEC, "run", r),
+    "create":  lambda r: run_generic(["create"], RUN_SPEC, "create", r),
+    "exec":    lambda r: run_generic(["exec"], EXEC_SPEC, "exec", r),
+    "ps":      lambda r: run_generic(["list"], PS_SPEC, "ps", r, drop_positionals=True),
+    "start":   lambda r: run_generic(["start"], START_SPEC, "start", r),
+    "stop":    lambda r: run_generic(["stop"], STOP_SPEC, "stop", r),
+    "restart": cmd_restart,
+    "kill":    lambda r: run_generic(["kill"], KILL_SPEC, "kill", r),
+    "rm":      lambda r: run_generic(["delete"], RM_SPEC, "rm", r),
+    "logs":    lambda r: run_generic(["logs"], LOGS_SPEC, "logs", r),
+    "cp":      lambda r: run_generic(["cp"], CP_SPEC, "cp", r),
+    "stats":   lambda r: run_generic(["stats"], STATS_SPEC, "stats", r),
+    "inspect": cmd_inspect,
+    "export":  lambda r: run_generic(["export"], EXPORT_SPEC, "export", r),
+    "pull":    lambda r: run_generic(["image", "pull"], PULL_SPEC, "pull", r),
+    "push":    lambda r: run_generic(["image", "push"], PUSH_SPEC, "push", r),
+    "images":  lambda r: run_generic(["image", "list"], IMAGES_SPEC, "images", r,
+                                     drop_positionals=True),
+    "rmi":     lambda r: run_generic(["image", "delete"], RMI_SPEC, "rmi", r),
+    "tag":     lambda r: run_generic(["image", "tag"], EMPTY_SPEC, "tag", r),
+    "save":    lambda r: run_generic(["image", "save"], SAVE_SPEC, "save", r),
+    "load":    lambda r: run_generic(["image", "load"], LOAD_SPEC, "load", r),
+    "build":   lambda r: run_generic(["build"], BUILD_SPEC, "build", r),
+    "login":   cmd_login,
+    "logout":  cmd_logout,
+    "version": cmd_version,
+    "info":    lambda r: execute([CONTAINER_BIN, *GLOBAL_FLAGS, "system", "status"]),
+    # no equivalents:
+    "attach":  cmd_unsupported("attach", "use 'docker logs -f <id>' or "
+                               "'docker exec -it <id> sh'"),
+    "commit":  cmd_unsupported("commit"),
+    "diff":    cmd_unsupported("diff"),
+    "events":  cmd_unsupported("events"),
+    "history": cmd_unsupported("history"),
+    "pause":   cmd_unsupported("pause"),
+    "unpause": cmd_unsupported("unpause"),
+    "port":    cmd_unsupported("port", "check 'docker inspect <id>' for port mappings"),
+    "rename":  cmd_unsupported("rename"),
+    "top":     cmd_unsupported("top", "use 'docker exec <id> ps aux'"),
+    "update":  cmd_unsupported("update"),
+    "wait":    cmd_unsupported("wait"),
+    "import":  cmd_unsupported("import", "use 'docker load' for OCI archives"),
+    "swarm":   cmd_unsupported("swarm"),
+    "context": cmd_unsupported("context"),
+    "manifest": cmd_unsupported("manifest"),
+    "compose": cmd_unsupported("compose", "Apple container has no compose support; "
+                               "run services individually with 'docker run'"),
+}
+
+CONTAINER_GROUP = {
+    "ls": "ps", "list": "ps", "ps": "ps",
+    "rm": "rm", "remove": "rm", "delete": "rm",
+    "run": "run", "create": "create", "exec": "exec",
+    "start": "start", "stop": "stop", "restart": "restart", "kill": "kill",
+    "logs": "logs", "inspect": "inspect", "stats": "stats", "cp": "cp",
+    "export": "export", "attach": "attach", "pause": "pause",
+    "unpause": "unpause", "port": "port", "rename": "rename", "top": "top",
+    "update": "update", "wait": "wait", "diff": "diff", "commit": "commit",
+}
+
+IMAGE_GROUP = {
+    "ls": "images", "list": "images",
+    "rm": "rmi", "remove": "rmi", "delete": "rmi",
+    "pull": "pull", "push": "push", "tag": "tag",
+    "save": "save", "load": "load", "build": "build",
+    "history": "history", "import": "import",
+}
+
+
+def dispatch_group(group, sub, rest):
+    """Handle docker's two-level management commands (image/container/...)."""
+    if group == "container":
+        if sub == "prune":
+            return cmd_container_prune(rest)
+        mapped = CONTAINER_GROUP.get(sub)
+        if mapped:
+            return HANDLERS[mapped](rest)
+    elif group == "image":
+        if sub == "prune":
+            return cmd_image_prune(rest)
+        if sub == "inspect":
+            return run_generic(["image", "inspect"], EMPTY_SPEC, "image inspect", rest)
+        mapped = IMAGE_GROUP.get(sub)
+        if mapped:
+            return HANDLERS[mapped](rest)
+    elif group == "volume":
+        if sub == "prune":
+            return cmd_volume_prune(rest)
+        table = {"ls": ["list"], "list": ["list"], "rm": ["delete"],
+                 "remove": ["delete"], "delete": ["delete"], "inspect": ["inspect"]}
+        if sub == "create":
+            return run_generic(["volume", "create"], VOLUME_CREATE_SPEC,
+                               "volume create", rest)
+        if sub in table:
+            return run_generic(["volume", *table[sub]], EMPTY_SPEC,
+                               f"volume {sub}", rest)
+    elif group == "network":
+        if sub == "prune":
+            return cmd_network_prune(rest)
+        table = {"ls": ["list"], "list": ["list"], "rm": ["delete"],
+                 "remove": ["delete"], "delete": ["delete"], "inspect": ["inspect"]}
+        if sub == "create":
+            return run_generic(["network", "create"], NETWORK_CREATE_SPEC,
+                               "network create", rest)
+        if sub in ("connect", "disconnect"):
+            return cmd_unsupported(f"network {sub}")(rest)
+        if sub in table:
+            return run_generic(["network", *table[sub]], EMPTY_SPEC,
+                               f"network {sub}", rest)
+    elif group == "system":
+        if sub == "prune":
+            return cmd_system_prune(rest)
+        if sub == "df":
+            return execute([CONTAINER_BIN, *GLOBAL_FLAGS, "system", "df"])
+        if sub == "info":
+            return execute([CONTAINER_BIN, *GLOBAL_FLAGS, "system", "status"])
+        if sub == "events":
+            return cmd_unsupported("system events")(rest)
+        # start/stop/status/logs/... pass straight through — handy extras
+        return execute([CONTAINER_BIN, *GLOBAL_FLAGS, "system", sub, *rest])
+    elif group == "builder":
+        if sub == "prune":
+            return cmd_unsupported("builder prune",
+                                   "use 'container builder delete' to reset the builder")(rest)
+        return execute([CONTAINER_BIN, *GLOBAL_FLAGS, "builder", sub, *rest])
+    elif group == "buildx":
+        if sub == "build":
+            return HANDLERS["build"](rest)
+        return cmd_unsupported(f"buildx {sub}")(rest)
+    die(f"unknown command 'docker {group} {sub}'")
+
+
+GROUPS = ("container", "image", "volume", "network", "system", "builder", "buildx")
+
+# docker global value-taking options we drop (with their values)
+GLOBAL_VALUE_OPTS = ("-H", "--host", "--context", "-c", "--config",
+                     "-l", "--log-level", "--tlscacert", "--tlscert", "--tlskey")
+
+
+def main(argv):
+    args = list(argv[1:])
+
+    while args:
+        tok = args[0]
+        name = tok.partition("=")[0]
+        if tok in ("-D", "--debug"):
+            GLOBAL_FLAGS.append("--debug")
+            args.pop(0)
+        elif tok in ("-v", "--version"):
+            cmd_version([])
+        elif tok in ("-h", "--help"):
+            print_help()
+        elif name in GLOBAL_VALUE_OPTS:
+            warn(f"dropping docker global option {tok}")
+            args.pop(0)
+            if "=" not in tok and args and not args[0].startswith("-"):
+                args.pop(0)
+        elif tok in ("--tls", "--tlsverify"):
+            warn(f"dropping docker global option {tok}")
+            args.pop(0)
+        else:
+            break
+
+    if not args:
+        print_help()
+
+    cmd = args.pop(0)
+
+    if cmd == "help":
+        if args:
+            cmd, args = args[0], args[1:] + ["--help"]
+        else:
+            print_help()
+
+    if cmd in GROUPS:
+        if not args:
+            execute([CONTAINER_BIN, *GLOBAL_FLAGS,
+                     "container" if cmd == "container" else cmd, "--help"]
+                    if cmd != "container" else [CONTAINER_BIN, "--help"])
+        sub = args.pop(0)
+        dispatch_group(cmd, sub, args)
+    elif cmd in HANDLERS:
+        HANDLERS[cmd](args)
+    else:
+        die(f"unknown command 'docker {cmd}' (run 'docker --help' for the "
+            "supported command list)")
+
+
+if __name__ == "__main__":
+    main(sys.argv)
