@@ -15,7 +15,7 @@ import shlex
 import subprocess
 import sys
 
-SHIM_VERSION = "0.1.0"
+SHIM_VERSION = "0.2.0"
 CONTAINER_BIN = os.environ.get("DOCKER_SHIM_CONTAINER_BIN", "container")
 DEBUG = os.environ.get("DOCKER_SHIM_DEBUG", "") not in ("", "0")
 STRICT = os.environ.get("DOCKER_SHIM_STRICT", "") not in ("", "0")
@@ -461,6 +461,29 @@ def run_generic(target, spec, name, rest, drop_positionals=False):
     execute([CONTAINER_BIN, *GLOBAL_FLAGS, *target, *flags, *pos, *frozen])
 
 
+def host_platform():
+    import platform as _platform
+    mach = _platform.machine().lower()
+    arch = {"arm64": "arm64", "aarch64": "arm64",
+            "x86_64": "amd64", "amd64": "amd64"}.get(mach)
+    return f"linux/{arch}" if arch else None
+
+
+def cmd_pull(rest):
+    flags, pos, frozen = translate(rest, PULL_SPEC, "pull")
+    # Docker pulls only the host platform by default; Apple container pulls
+    # every architecture in the manifest. Limit to the host platform unless
+    # the user chose one (flag or CONTAINER_DEFAULT_PLATFORM) or opted out
+    # with DOCKER_SHIM_PULL_ALL_PLATFORMS=1.
+    if ("--platform" not in flags and "--help" not in flags
+            and not os.environ.get("CONTAINER_DEFAULT_PLATFORM")
+            and os.environ.get("DOCKER_SHIM_PULL_ALL_PLATFORMS", "") in ("", "0")):
+        plat = host_platform()
+        if plat:
+            flags += ["--platform", plat]
+    execute([CONTAINER_BIN, *GLOBAL_FLAGS, "image", "pull", *flags, *pos, *frozen])
+
+
 def cmd_restart(rest):
     flags, pos, frozen = translate(rest, STOP_SPEC, "restart")
     ids = pos + frozen
@@ -664,7 +687,7 @@ HANDLERS = {
     "stats":   lambda r: run_generic(["stats"], STATS_SPEC, "stats", r),
     "inspect": cmd_inspect,
     "export":  lambda r: run_generic(["export"], EXPORT_SPEC, "export", r),
-    "pull":    lambda r: run_generic(["image", "pull"], PULL_SPEC, "pull", r),
+    "pull":    cmd_pull,
     "push":    lambda r: run_generic(["image", "push"], PUSH_SPEC, "push", r),
     "images":  lambda r: run_generic(["image", "list"], IMAGES_SPEC, "images", r,
                                      drop_positionals=True),

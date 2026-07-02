@@ -79,6 +79,11 @@ compose — apple/container 1.0.0 has no equivalent capability.
 
 ## Known semantic differences
 
+- Apple container's `image pull` downloads **every** architecture in the
+  manifest by default. The shim restores Docker's behavior and pulls only the
+  host platform (e.g. `linux/arm64`, ~4 MB for alpine instead of ~29 MB for
+  all 8 platforms). An explicit `--platform` or `CONTAINER_DEFAULT_PLATFORM`
+  is respected; set `DOCKER_SHIM_PULL_ALL_PLATFORMS=1` to opt out.
 - Every container is a lightweight VM with its own IP (visible in `docker ps`).
   `-p` port publishing works, but there is no host network mode.
 - `--restart` policies, healthchecks and fine-grained cgroup limits are dropped.
@@ -90,6 +95,7 @@ compose — apple/container 1.0.0 has no equivalent capability.
 DOCKER_SHIM_DEBUG=1 docker run -d nginx   # print the translated command
 DOCKER_SHIM_STRICT=1 docker run ...       # fail on unsupported flags
 DOCKER_SHIM_CONTAINER_BIN=echo docker ... # dry run: only show the translation
+DOCKER_SHIM_PULL_ALL_PLATFORMS=1 docker pull ... # pull all architectures (Apple default)
 ```
 
 ## License

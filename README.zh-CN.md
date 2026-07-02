@@ -75,6 +75,11 @@ apple/container 1.0.0 中没有对应能力。
 
 ## 已知语义差异
 
+- Apple container 的 `image pull` 默认会把 manifest 里**所有架构**都拉下来。
+  shim 恢复了 Docker 的行为，只拉当前平台（如 `linux/arm64`，alpine 约 4 MB，
+  而全部 8 个平台约 29 MB）。显式指定 `--platform` 或设置了
+  `CONTAINER_DEFAULT_PLATFORM` 时以用户为准；设
+  `DOCKER_SHIM_PULL_ALL_PLATFORMS=1` 可退回全架构拉取。
 - 每个容器是独立轻量 VM，有自己的 IP（`docker ps` 可见），`-p` 端口映射可用，
   但没有 host 网络模式。
 - `--restart` 策略、healthcheck、cgroup 细粒度资源限制不生效（被丢弃）。
@@ -86,6 +91,7 @@ apple/container 1.0.0 中没有对应能力。
 DOCKER_SHIM_DEBUG=1 docker run -d nginx   # 打印翻译后的实际命令
 DOCKER_SHIM_STRICT=1 docker run ...       # 不支持的 flag 直接报错
 DOCKER_SHIM_CONTAINER_BIN=echo docker ... # 干跑，只看翻译结果
+DOCKER_SHIM_PULL_ALL_PLATFORMS=1 docker pull ... # 拉取全部架构（Apple 默认行为）
 ```
 
 ## 协议
