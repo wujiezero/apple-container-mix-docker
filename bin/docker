@@ -2,12 +2,16 @@
 """
 docker-shim: translate Docker CLI invocations into Apple `container` CLI calls.
 
-Targets apple/container 1.0.0 (https://github.com/apple/container).
+Targets apple/container 1.3.x (https://github.com/apple/container);
+tested against 1.3.1, still compatible with 1.0.x.
 
 Environment variables:
   DOCKER_SHIM_DEBUG=1          print the translated command before running it
   DOCKER_SHIM_STRICT=1         fail on unsupported flags instead of dropping them
   DOCKER_SHIM_CONTAINER_BIN    path to the `container` binary (default: container)
+  DOCKER_SHIM_REGISTRY_SCHEME  force http|https for registry access (default:
+                               http for localhost registries, https elsewhere)
+  DOCKER_SHIM_PULL_ALL_PLATFORMS=1  pull every architecture, not just the host's
 """
 
 import os
@@ -15,7 +19,7 @@ import shlex
 import subprocess
 import sys
 
-SHIM_VERSION = "0.3.0"
+SHIM_VERSION = "0.4.0"
 CONTAINER_BIN = os.environ.get("DOCKER_SHIM_CONTAINER_BIN", "container")
 DEBUG = os.environ.get("DOCKER_SHIM_DEBUG", "") not in ("", "0")
 STRICT = os.environ.get("DOCKER_SHIM_STRICT", "") not in ("", "0")
@@ -156,11 +160,35 @@ def unknown_flag(name, cmd_name, had_inline_value):
 # ---------------------------------------------------------------------------
 # value-flag callables
 
-def fmt_json(val):
-    if val.strip() in ("json", "{{json .}}"):
+def fmt_output(val):
+    """docker --format → container --format (json|table|yaml|toml only)."""
+    v = val.strip()
+    if v in ("json", "{{json .}}"):
         return ["--format", "json"]
+    if v in ("table", "yaml", "toml"):
+        return ["--format", v]
     warn("Go-template --format values are not supported; using default table output")
     return []
+
+
+def tail_lines(val):
+    """docker --tail all means 'everything', which is container's default."""
+    if val.strip() == "all":
+        return []
+    return ["-n", val]
+
+
+def volume_opt(val):
+    """docker 'volume create --opt size=1G' is container's '-s 1G'."""
+    key, eq, size = val.partition("=")
+    if eq and key.strip() in ("size", "o.size"):
+        return ["-s", size]
+    return ["--opt", val]
+
+
+def net_subnet(val):
+    """container splits the subnet flag by address family."""
+    return ["--subnet-v6" if ":" in val else "--subnet", val]
 
 
 def map_network(val):
@@ -176,6 +204,46 @@ def map_network(val):
 
 def quiet_progress(_val=None):
     return ["--progress", "none"]
+
+
+# ---------------------------------------------------------------------------
+# registry scheme
+#
+# apple/container 1.3.0 removed `--scheme auto` and defaults to https, so
+# plain-HTTP local registries that worked on 1.0/1.2 now fail. Docker treats
+# localhost registries as insecure; mirror that here.
+
+def _bare_host(host):
+    if host.startswith("["):            # [::1]:5000
+        return host.partition("]")[0].lstrip("[")
+    return host.split(":")[0]
+
+
+def _is_local_host(host):
+    host = _bare_host(host)
+    return (host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+            or host.endswith(".localhost"))
+
+
+def registry_host(reference):
+    """Registry hostname of an image reference (None means Docker Hub)."""
+    head = reference.split("/")[0]
+    if "/" in reference and ("." in head or ":" in head or head == "localhost"):
+        return head
+    return None
+
+
+def scheme_flags_for_host(host):
+    forced = os.environ.get("DOCKER_SHIM_REGISTRY_SCHEME", "").strip().lower()
+    if forced in ("http", "https"):
+        return ["--scheme", forced]
+    if host and _is_local_host(host):
+        return ["--scheme", "http"]
+    return []
+
+
+def scheme_flags(reference):
+    return scheme_flags_for_host(registry_host(reference or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +305,8 @@ RUN_SPEC = {
         "--stop-signal": DROP, "--stop-timeout": DROP,
         "--memory-swap": DROP, "--memory-reservation": DROP,
         "--memory-swappiness": DROP, "--kernel-memory": DROP,
-        "--cpu-shares": DROP, "--cpu-period": DROP, "--cpu-quota": DROP,
+        "-c": DROP, "--cpu-shares": DROP,
+        "--cpu-period": DROP, "--cpu-quota": DROP,
         "--cpuset-cpus": DROP, "--cpuset-mems": DROP,
         "--blkio-weight": DROP, "--pids-limit": DROP,
         "--userns": DROP, "--group-add": DROP,
@@ -278,7 +347,7 @@ PS_SPEC = {
         "--no-trunc": SILENT,
     },
     "value": {
-        "--format": fmt_json,
+        "--format": fmt_output,
         "-f": DROP, "--filter": DROP,
         "-n": DROP, "--last": DROP,
     },
@@ -292,7 +361,7 @@ IMAGES_SPEC = {
         "--no-trunc": SILENT,
     },
     "value": {
-        "--format": fmt_json,
+        "--format": fmt_output,
         "-f": DROP, "--filter": DROP,
     },
 }
@@ -345,7 +414,7 @@ BUILD_SPEC = {
         "-o": "--output", "--output": "--output",
         "-m": "--memory", "--memory": "--memory",
         "--network": DROP,
-        "--ssh": DROP,
+        "--ssh": "--ssh",   # container 1.2.0+
         "--cache-from": DROP, "--cache-to": DROP,
         "--builder": DROP,
         "--iidfile": DROP,
@@ -362,7 +431,7 @@ LOGS_SPEC = {
         "--details": SILENT,
     },
     "value": {
-        "--tail": "-n", "-n": "-n",
+        "--tail": tail_lines, "-n": tail_lines,
         "--since": DROP, "--until": DROP,
     },
 }
@@ -403,7 +472,7 @@ STATS_SPEC = {
         "-a": DROP, "--all": DROP,
         "--no-trunc": SILENT,
     },
-    "value": {"--format": fmt_json},
+    "value": {"--format": fmt_output},
 }
 
 SAVE_SPEC = {
@@ -427,9 +496,9 @@ CP_SPEC = {
 }
 
 NETWORK_CREATE_SPEC = {
-    "bool": {"--internal": "--internal"},
+    "bool": {"--internal": "--internal", "--ipv6": DROP},
     "value": {
-        "--subnet": "--subnet",
+        "--subnet": net_subnet,
         "--label": "--label",
         "-o": "--option", "--opt": "--option",
         "-d": DROP, "--driver": DROP,
@@ -441,7 +510,7 @@ VOLUME_CREATE_SPEC = {
     "bool": {},
     "value": {
         "--label": "--label",
-        "-o": "--opt", "--opt": "--opt",
+        "-o": volume_opt, "--opt": volume_opt,
         "-d": SILENT, "--driver": SILENT,
     },
 }
@@ -469,6 +538,21 @@ def host_platform():
     return f"linux/{arch}" if arch else None
 
 
+def cmd_run(target, name, rest):
+    """run/create: pick the registry scheme from the image reference."""
+    flags, pos, frozen = translate(rest, RUN_SPEC, name)
+    if pos:
+        flags = scheme_flags(pos[0]) + flags
+    execute([CONTAINER_BIN, *GLOBAL_FLAGS, *target, *flags, *pos, *frozen])
+
+
+def cmd_push(rest):
+    flags, pos, frozen = translate(rest, PUSH_SPEC, "push")
+    if pos:
+        flags = scheme_flags(pos[0]) + flags
+    execute([CONTAINER_BIN, *GLOBAL_FLAGS, "image", "push", *flags, *pos, *frozen])
+
+
 def cmd_pull(rest):
     flags, pos, frozen = translate(rest, PULL_SPEC, "pull")
     # Docker pulls only the host platform by default; Apple container pulls
@@ -481,6 +565,8 @@ def cmd_pull(rest):
         plat = host_platform()
         if plat:
             flags += ["--platform", plat]
+    if pos:
+        flags = scheme_flags(pos[0]) + flags
     execute([CONTAINER_BIN, *GLOBAL_FLAGS, "image", "pull", *flags, *pos, *frozen])
 
 
@@ -567,6 +653,7 @@ def cmd_login(rest):
             server = tok
         i += 1
     argv = [CONTAINER_BIN, *GLOBAL_FLAGS, "registry", "login"]
+    argv += scheme_flags_for_host(server or "")
     if user:
         argv += ["--username", user]
     if password is not None or pw_stdin:
@@ -656,9 +743,11 @@ Translated commands:
 
 * restart is emulated as stop + start.
 
-Everything is forwarded to the `container` CLI (apple/container).
-Unsupported docker flags are dropped with a warning (DOCKER_SHIM_STRICT=1 to fail).
-DOCKER_SHIM_DEBUG=1 prints each translated command.
+Everything is forwarded to the `container` CLI (apple/container 1.0+, tested
+against 1.3.1). Unsupported docker flags are dropped with a warning
+(DOCKER_SHIM_STRICT=1 to fail). DOCKER_SHIM_DEBUG=1 prints each translated
+command. Registries on localhost are contacted over http (container 1.3 defaults
+to https); DOCKER_SHIM_REGISTRY_SCHEME=http|https overrides that.
 
 Run 'container --help' to see the native CLI.
 """
@@ -673,8 +762,8 @@ def print_help():
 # dispatch
 
 HANDLERS = {
-    "run":     lambda r: run_generic(["run"], RUN_SPEC, "run", r),
-    "create":  lambda r: run_generic(["create"], RUN_SPEC, "create", r),
+    "run":     lambda r: cmd_run(["run"], "run", r),
+    "create":  lambda r: cmd_run(["create"], "create", r),
     "exec":    lambda r: run_generic(["exec"], EXEC_SPEC, "exec", r),
     "ps":      lambda r: run_generic(["list"], PS_SPEC, "ps", r, drop_positionals=True),
     "start":   lambda r: run_generic(["start"], START_SPEC, "start", r),
@@ -688,7 +777,7 @@ HANDLERS = {
     "inspect": cmd_inspect,
     "export":  lambda r: run_generic(["export"], EXPORT_SPEC, "export", r),
     "pull":    cmd_pull,
-    "push":    lambda r: run_generic(["image", "push"], PUSH_SPEC, "push", r),
+    "push":    cmd_push,
     "images":  lambda r: run_generic(["image", "list"], IMAGES_SPEC, "images", r,
                                      drop_positionals=True),
     "rmi":     lambda r: run_generic(["image", "delete"], RMI_SPEC, "rmi", r),

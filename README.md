@@ -7,7 +7,8 @@ it translates `docker` commands into the corresponding `container` CLI calls, so
 `docker pull redis`, `docker run -d -p 6379:6379 redis`, `docker exec -it ... sh`
 and friends keep working on a Mac with no Docker installed.
 
-Tested against apple/container **1.0.0** on Apple Silicon (macOS 26).
+Tested against apple/container **1.3.1** on Apple Silicon (macOS 26); still
+compatible with 1.0.x.
 
 ## Requirements
 
@@ -76,7 +77,7 @@ container/image/network(/volume) prune with a confirmation prompt.
 
 Explicitly **unsupported** (clear error + suggested alternative): attach,
 commit, pause/unpause, top, port, wait, events, history, swarm, context —
-apple/container 1.0.0 has no equivalent capability.
+apple/container has no equivalent capability.
 
 ## docker compose
 
@@ -125,7 +126,12 @@ Details worth knowing:
 - Every container is a lightweight VM with its own IP (visible in `docker ps`).
   `-p` port publishing works, but there is no host network mode.
 - `--restart` policies, healthchecks and fine-grained cgroup limits are dropped.
-- `ps --format` / `inspect --format` only accept `json`, not Go templates.
+- `ps --format` / `images --format` accept `json`, `table`, `yaml` and `toml`
+  (container 1.3), but not Go templates; `inspect --format` is not supported.
+- Registries on `localhost` / `127.0.0.1` are contacted over **http**. Apple
+  container 1.3.0 removed `--scheme auto` and now defaults to https, which
+  breaks local plain-HTTP registries; the shim restores Docker's behavior.
+  `DOCKER_SHIM_REGISTRY_SCHEME=http|https` forces one scheme everywhere.
 - `chmod`/`chown` on a bind mount's **mount point itself** is denied by
   virtiofs (subdirectories and files inside it work normally) — this breaks
   database images at startup, see below.
@@ -178,6 +184,7 @@ DOCKER_SHIM_DEBUG=1 docker run -d nginx   # print the translated command
 DOCKER_SHIM_STRICT=1 docker run ...       # fail on unsupported flags
 DOCKER_SHIM_CONTAINER_BIN=echo docker ... # dry run: only show the translation
 DOCKER_SHIM_PULL_ALL_PLATFORMS=1 docker pull ... # pull all architectures (Apple default)
+DOCKER_SHIM_REGISTRY_SCHEME=http docker pull ... # force the registry scheme
 ```
 
 ## License

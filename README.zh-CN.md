@@ -7,7 +7,7 @@ Docker CLI 兼容层：把 `docker` 命令翻译并转发给 Apple 官方的
 `docker pull redis`、`docker run -d -p 6379:6379 redis`、`docker exec -it ... sh`
 这类命令，在没有 Docker 的 Mac 上由 `container` CLI 实际完成。
 
-基于 apple/container **1.0.0**、Apple Silicon（macOS 26）实测。
+基于 apple/container **1.3.1**、Apple Silicon（macOS 26）实测，1.0.x 同样兼容。
 
 ## 前置条件
 
@@ -72,7 +72,7 @@ prune 并先确认。
 
 明确**不支持**（会给出明确报错和替代建议）：attach, commit, pause/unpause,
 top, port, wait, events, history, swarm, context——这些在
-apple/container 1.0.0 中没有对应能力。
+apple/container 中没有对应能力。
 
 ## docker compose
 
@@ -116,7 +116,12 @@ docker compose pull / build / config
 - 每个容器是独立轻量 VM，有自己的 IP（`docker ps` 可见），`-p` 端口映射可用，
   但没有 host 网络模式。
 - `--restart` 策略、healthcheck、cgroup 细粒度资源限制不生效（被丢弃）。
-- `ps --format` / `inspect --format` 只支持 `json`，不支持 Go template。
+- `ps --format` / `images --format` 支持 `json`、`table`、`yaml`、`toml`
+  （container 1.3 的取值），但不支持 Go template；`inspect --format` 不支持。
+- 访问 `localhost` / `127.0.0.1` 上的 registry 会走 **http**。container 1.3.0
+  删掉了 `--scheme auto`、默认改成 https，本地明文 registry 会直接失败，shim
+  按 Docker 的习惯把它改回来。`DOCKER_SHIM_REGISTRY_SCHEME=http|https`
+  可以全局强制某一种。
 - 容器内对 bind mount 的**挂载点本身**做 `chmod`/`chown` 会被 virtiofs 拒绝
   （挂载点里面的子目录和文件完全正常）——数据库镜像会因此起不来，见下节。
 
@@ -165,6 +170,7 @@ DOCKER_SHIM_DEBUG=1 docker run -d nginx   # 打印翻译后的实际命令
 DOCKER_SHIM_STRICT=1 docker run ...       # 不支持的 flag 直接报错
 DOCKER_SHIM_CONTAINER_BIN=echo docker ... # 干跑，只看翻译结果
 DOCKER_SHIM_PULL_ALL_PLATFORMS=1 docker pull ... # 拉取全部架构（Apple 默认行为）
+DOCKER_SHIM_REGISTRY_SCHEME=http docker pull ... # 强制 registry 访问协议
 ```
 
 ## 协议
