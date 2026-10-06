@@ -7,13 +7,13 @@ it translates `docker` commands into the corresponding `container` CLI calls, so
 `docker pull redis`, `docker run -d -p 6379:6379 redis`, `docker exec -it ... sh`
 and friends keep working on a Mac with no Docker installed.
 
-Tested against apple/container **1.3.1** on Apple Silicon (macOS 26); still
-compatible with 1.0.x.
+Tested against apple/container **1.5.0** on Apple Silicon; previously validated
+against 1.3.1.
 
 ## Requirements
 
 - Apple Silicon Mac with the [container](https://github.com/apple/container/releases)
-  CLI installed (`/usr/local/bin/container`).
+  CLI installed and on `PATH` (Homebrew typically uses `/opt/homebrew/bin/container`).
 - Python 3 (any recent version; the shim has no third-party dependencies).
 
 ## Quick start
@@ -42,7 +42,9 @@ this project (add `--stop-services` to also stop the `container` services).
 
 ## How it works
 
-`bin/docker` is a single dependency-free Python 3 script with three layers:
+`bin/docker` is a Python 3 script with no third-party dependencies. It shares
+entrypoint argument translation with Compose through `bin/shim_common.py` and
+has three layers:
 
 1. **Subcommand renaming** — `ps`→`list`, `rm`→`delete`, `pull`→`image pull`,
    `rmi`→`image delete`, `login`→`registry login`, and the two-level
@@ -62,6 +64,16 @@ Single-command invocations are `execvp`'d, so TTY interaction
 container first and falls back to the image, `login -p` is converted to
 `--password-stdin`, `system prune` fans out to
 container/image/network(/volume) prune with a confirmation prompt.
+
+`docker start A B` starts each container separately, continues after failures,
+and returns a nonzero exit code if any start fails. `start -a/-i` accepts only
+one container to preserve interactive terminal behavior.
+
+`docker run/create --entrypoint "" IMAGE COMMAND [ARGS...]` executes the explicit
+command directly, bypassing the image entrypoint; omitting the command is an
+error. No shell is introduced, so spaces and special characters remain literal
+arguments. Compose `entrypoint: []` / `entrypoint: ""` has the same behavior and
+requires an explicit `command` or `compose run SERVICE COMMAND`.
 
 ## Supported commands
 
@@ -187,7 +199,21 @@ DOCKER_SHIM_PULL_ALL_PLATFORMS=1 docker pull ... # pull all architectures (Apple
 DOCKER_SHIM_REGISTRY_SCHEME=http docker pull ... # force the registry scheme
 ```
 
+## Validation
+
+Run the dependency-free regression suite (no local containers are contacted or
+modified):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Validated on 1.5.0: multi-container start, continuation after a failed start,
+empty entrypoints with run/create, Compose up/ps, and command overrides with
+attached/detached Compose run. Temporary resources were cleaned up afterward.
+Image builds, remote registries, and interactive TTY behavior were not retested
+in this update.
+
 ## License
 
 [MIT](LICENSE)
-

@@ -23,7 +23,9 @@ import subprocess
 import sys
 import threading
 
-SHIM_VERSION = "0.4.0"
+from shim_common import prepare_run_args
+
+SHIM_VERSION = "0.5.0"
 CONTAINER_BIN = os.environ.get("DOCKER_SHIM_CONTAINER_BIN", "container")
 DEBUG = os.environ.get("DOCKER_SHIM_DEBUG", "") not in ("", "0")
 
@@ -57,6 +59,13 @@ def exec_cli(args):
         os.execvp(argv[0], argv)
     except FileNotFoundError:
         die(f"'{CONTAINER_BIN}' not found — is Apple container installed?")
+
+
+def native_run_args(flags, image, command):
+    try:
+        return prepare_run_args(flags, image, command)
+    except ValueError as error:
+        die(str(error))
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +421,7 @@ UNSUPPORTED_KEYS = {
 }
 
 
-def service_run_args(proj, svc):
+def service_run_args(proj, svc, entrypoint_override=None, command_override=None):
     cfg = proj.services[svc]
     args = ["--name", proj.container_name(svc)]
     args += ["--label", f"com.docker.compose.project={proj.name}",
@@ -495,7 +504,10 @@ def service_run_args(proj, svc):
 
     # entrypoint / command
     tail = []
-    entrypoint = cfg.get("entrypoint")
+    # CLI overrides name one executable; only Compose configuration strings
+    # use shell-style word splitting to express an entrypoint with arguments.
+    entrypoint = ([entrypoint_override] if entrypoint_override else []) \
+        if entrypoint_override is not None else cfg.get("entrypoint")
     if entrypoint is not None:
         ep = shlex.split(entrypoint) if isinstance(entrypoint, str) else list(entrypoint)
         if ep:
@@ -503,7 +515,8 @@ def service_run_args(proj, svc):
             tail += ep[1:]
         else:
             args += ["--entrypoint", ""]
-    command = cfg.get("command")
+    command = (command_override if command_override is not None
+               else cfg.get("command"))
     if command is not None:
         tail += shlex.split(command) if isinstance(command, str) else [str(c) for c in command]
 
@@ -725,7 +738,7 @@ def bring_up(proj, selected, build=False, force_recreate=False):
                     die(f"failed to start {cname}: {(r.stderr or '').strip()}")
                 print(f" ✔ Container {cname}  Started")
         else:
-            r = run_cli(["run", "--detach", *args, image, *tail],
+            r = run_cli(["run", *native_run_args(["--detach", *args], image, tail)],
                         capture_output=True, text=True)
             if r.returncode != 0:
                 die(f"failed to create {cname}: {(r.stderr or '').strip()}")
@@ -1044,7 +1057,13 @@ def cmd_run(proj, args):
     if deps and not no_deps:
         bring_up(proj, deps)
 
-    run_args, image, tail = service_run_args(proj, service)
+    entrypoint_override = None
+    for j in range(0, len(extra), 2):
+        if extra[j] == "--entrypoint":
+            entrypoint_override = extra[j + 1]
+    run_args, image, tail = service_run_args(
+        proj, service, entrypoint_override=entrypoint_override,
+        command_override=command if command else None)
     # one-off container: unique name, no published ports unless asked
     if "--name" not in extra:
         rname = f"{proj.name}-{service}-run-{os.getpid()}"
@@ -1070,14 +1089,12 @@ def cmd_run(proj, args):
         cleaned.append("--detach")
     elif sys.stdin.isatty():
         cleaned += ["--interactive", "--tty"]
-    if command:
-        tail = command
     if "build" in proj.services[service] and not image_exists(image):
         do_build(proj, service, image)
     ensure_infra(proj, {service})
 
     if detach:
-        r = run_cli(["run", *cleaned, image, *tail], capture_output=True, text=True)
+        r = run_cli(["run", *native_run_args(cleaned, image, tail)], capture_output=True, text=True)
         if r.returncode != 0:
             die(f"failed to run {service}: {(r.stderr or '').strip()}")
         inject_hosts(proj, [rname])
@@ -1094,12 +1111,13 @@ def cmd_run(proj, args):
         block = "\n".join(entries)
         script = (f"printf '%s\\n' {shlex.quote(block)} >> /etc/hosts 2>/dev/null; "
                   f"exec {shlex.join(str(t) for t in tail)}")
-        exec_cli(["run", *cleaned, "--entrypoint", "/bin/sh", image, "-c", script])
+        exec_cli(["run", *native_run_args([*cleaned, "--entrypoint", "/bin/sh"],
+                                         image, ["-c", script])])
     else:
         if entries:
             warn("service discovery is unavailable in this one-off container "
                  "(custom entrypoint or no explicit command)")
-        exec_cli(["run", *cleaned, image, *tail])
+        exec_cli(["run", *native_run_args(cleaned, image, tail)])
 
 
 def cmd_config(proj, args):

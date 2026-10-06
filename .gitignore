@@ -3,8 +3,10 @@
 
 .DS_Store
 *.bak
-__pycache__/
 
 # bin/ holds the shim itself, not build output — override the global gitignore
 !bin/
 !bin/**
+
+# Shared Python modules generate bytecode even when invoked through symlinks.
+__pycache__/

@@ -2,8 +2,8 @@
 """
 docker-shim: translate Docker CLI invocations into Apple `container` CLI calls.
 
-Targets apple/container 1.3.x (https://github.com/apple/container);
-tested against 1.3.1, still compatible with 1.0.x.
+Targets apple/container 1.x (https://github.com/apple/container);
+tested against 1.5.0 and previously 1.3.1.
 
 Environment variables:
   DOCKER_SHIM_DEBUG=1          print the translated command before running it
@@ -19,7 +19,9 @@ import shlex
 import subprocess
 import sys
 
-SHIM_VERSION = "0.4.0"
+from shim_common import prepare_run_args
+
+SHIM_VERSION = "0.5.0"
 CONTAINER_BIN = os.environ.get("DOCKER_SHIM_CONTAINER_BIN", "container")
 DEBUG = os.environ.get("DOCKER_SHIM_DEBUG", "") not in ("", "0")
 STRICT = os.environ.get("DOCKER_SHIM_STRICT", "") not in ("", "0")
@@ -541,8 +543,15 @@ def host_platform():
 def cmd_run(target, name, rest):
     """run/create: pick the registry scheme from the image reference."""
     flags, pos, frozen = translate(rest, RUN_SPEC, name)
+    if not pos and frozen:
+        pos, frozen = frozen[:1], frozen[1:]
     if pos:
         flags = scheme_flags(pos[0]) + flags
+        try:
+            rest = prepare_run_args(flags, pos[0], frozen)
+        except ValueError as error:
+            die(str(error))
+        execute([CONTAINER_BIN, *GLOBAL_FLAGS, *target, *rest])
     execute([CONTAINER_BIN, *GLOBAL_FLAGS, *target, *flags, *pos, *frozen])
 
 
@@ -568,6 +577,25 @@ def cmd_pull(rest):
     if pos:
         flags = scheme_flags(pos[0]) + flags
     execute([CONTAINER_BIN, *GLOBAL_FLAGS, "image", "pull", *flags, *pos, *frozen])
+
+
+def cmd_start(rest):
+    flags, pos, frozen = translate(rest, START_SPEC, "start")
+    ids = pos + frozen
+    if "--help" in flags:
+        execute([CONTAINER_BIN, *GLOBAL_FLAGS, "start", *flags, *ids])
+    if not ids:
+        die("'start' requires at least one container")
+    if len(ids) == 1:
+        execute([CONTAINER_BIN, *GLOBAL_FLAGS, "start", *flags, *ids])
+    if "--attach" in flags or "--interactive" in flags:
+        die("'start --attach/--interactive' requires exactly one container")
+    rc = 0
+    for cid in ids:
+        result = run_sub([CONTAINER_BIN, *GLOBAL_FLAGS, "start", *flags, cid])
+        if result and not rc:
+            rc = result
+    sys.exit(rc)
 
 
 def cmd_restart(rest):
@@ -743,8 +771,8 @@ Translated commands:
 
 * restart is emulated as stop + start.
 
-Everything is forwarded to the `container` CLI (apple/container 1.0+, tested
-against 1.3.1). Unsupported docker flags are dropped with a warning
+Everything is forwarded to the `container` CLI (apple/container 1.x, tested
+against 1.5.0). Unsupported docker flags are dropped with a warning
 (DOCKER_SHIM_STRICT=1 to fail). DOCKER_SHIM_DEBUG=1 prints each translated
 command. Registries on localhost are contacted over http (container 1.3 defaults
 to https); DOCKER_SHIM_REGISTRY_SCHEME=http|https overrides that.
@@ -766,7 +794,7 @@ HANDLERS = {
     "create":  lambda r: cmd_run(["create"], "create", r),
     "exec":    lambda r: run_generic(["exec"], EXEC_SPEC, "exec", r),
     "ps":      lambda r: run_generic(["list"], PS_SPEC, "ps", r, drop_positionals=True),
-    "start":   lambda r: run_generic(["start"], START_SPEC, "start", r),
+    "start":   cmd_start,
     "stop":    lambda r: run_generic(["stop"], STOP_SPEC, "stop", r),
     "restart": cmd_restart,
     "kill":    lambda r: run_generic(["kill"], KILL_SPEC, "kill", r),

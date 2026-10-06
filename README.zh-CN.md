@@ -7,12 +7,12 @@ Docker CLI 兼容层：把 `docker` 命令翻译并转发给 Apple 官方的
 `docker pull redis`、`docker run -d -p 6379:6379 redis`、`docker exec -it ... sh`
 这类命令，在没有 Docker 的 Mac 上由 `container` CLI 实际完成。
 
-基于 apple/container **1.3.1**、Apple Silicon（macOS 26）实测，1.0.x 同样兼容。
+当前基于 apple/container **1.5.0**、Apple Silicon 实测；此前验证过 1.3.1。
 
 ## 前置条件
 
 - Apple Silicon Mac，已安装 [container](https://github.com/apple/container/releases)
-  CLI（`/usr/local/bin/container`）。
+  CLI，并确保 `container` 在 `PATH` 中（Homebrew 通常安装到 `/opt/homebrew/bin/container`）。
 - Python 3（任意较新版本，脚本零第三方依赖）。
 
 ## 一键安装
@@ -40,7 +40,8 @@ cd apple-container-mix-docker
 
 ## 工作原理
 
-`bin/docker` 是一个无依赖的 Python 3 脚本，分三层处理：
+`bin/docker` 是一个无第三方依赖的 Python 3 脚本，与 Compose 共用
+`bin/shim_common.py` 中的入口参数转换，分三层处理：
 
 1. **子命令改名**：`ps`→`list`、`rm`→`delete`、`pull`→`image pull`、
    `rmi`→`image delete`、`login`→`registry login`，以及
@@ -57,6 +58,14 @@ cd apple-container-mix-docker
 `docker inspect` 先按容器查、查不到自动按镜像查，`login -p` 自动转成
 `--password-stdin`，`system prune` 展开为 container/image/network(/volume)
 prune 并先确认。
+
+`docker start A B` 会逐个启动；某个启动失败后仍继续处理其余容器，并返回
+非零退出码。`start -a/-i` 仅允许一个容器，以保留交互终端行为。
+
+`docker run/create --entrypoint "" IMAGE COMMAND [ARGS...]` 会直接执行显式命令，
+绕过镜像入口；未提供命令时会报错。转换不经过 shell，参数中的空格和特殊
+字符保持原样。Compose 的 `entrypoint: []` / `entrypoint: ""` 行为相同，需配合
+显式 `command` 或 `compose run SERVICE COMMAND` 使用。
 
 ## 支持范围
 
@@ -173,7 +182,18 @@ DOCKER_SHIM_PULL_ALL_PLATFORMS=1 docker pull ... # 拉取全部架构（Apple �
 DOCKER_SHIM_REGISTRY_SCHEME=http docker pull ... # 强制 registry 访问协议
 ```
 
+## 验证
+
+运行无第三方依赖的回归测试（不连接或修改本机容器）：
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+1.5.0 已实测：多容器启动、启动失败后继续处理、run/create 清空入口、Compose
+up/ps 和前台/后台 run 的命令覆盖。验证使用临时资源，结束后清理；镜像构建、
+远程 registry 和交互 TTY 未在本次更新中重新实测。
+
 ## 协议
 
 [MIT](LICENSE)
-
