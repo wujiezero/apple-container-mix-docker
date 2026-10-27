@@ -7,7 +7,7 @@ Docker CLI 兼容层：把 `docker` 命令翻译并转发给 Apple 官方的
 `docker pull redis`、`docker run -d -p 6379:6379 redis`、`docker exec -it ... sh`
 这类命令，在没有 Docker 的 Mac 上由 `container` CLI 实际完成。
 
-当前基于 apple/container **1.5.0**、Apple Silicon 实测；此前验证过 1.3.1。
+当前基于 apple/container **1.6.1**、Apple Silicon 实测；此前验证过 1.5.0 和 1.3.1。
 
 ## 前置条件
 
@@ -67,11 +67,22 @@ prune 并先确认。
 字符保持原样。Compose 的 `entrypoint: []` / `entrypoint: ""` 行为相同，需配合
 显式 `command` 或 `compose run SERVICE COMMAND` 使用。
 
+`docker commit CONTAINER REPOSITORY[:TAG]` 映射到 `container commit`
+（container 1.6 起）。`-a/-m/-c` 会告警后丢弃，且必须给出镜像名。与 Docker
+不同，提交出的镜像会把容器进程记录为 `Entrypoint=[argv0]` + `Cmd=[其余参数]`，
+因此 `docker run IMAGE 其他命令` 会把“其他命令”当作该程序的参数；要换命令请用
+`docker run --entrypoint "" IMAGE 其他命令`。
+
+`--network-alias NAME` 映射为 container 1.6 的 `--network <网络>,alias=NAME`
+（没给 `--network` 时用 default 网络）。别名由 container 的 DNS 域提供解析：
+单段名称需要在 `~/.config/container/config.toml` 配置 `[dns] domain`，否则告警
+后丢弃；`api.test` 这类带点的名称直接透传。
+
 ## 支持范围
 
 | 类别 | 命令 |
 | --- | --- |
-| 容器 | run, create, exec, ps, start, stop, kill, rm, logs, cp, stats, inspect, export, restart（模拟） |
+| 容器 | run, create, exec, ps, start, stop, kill, rm, logs, cp, stats, inspect, export, commit, restart（模拟） |
 | 镜像 | pull, push, images, rmi, tag, save, load, build |
 | 登录 | login, logout |
 | 分组 | `docker container/image/volume/network/system ...` 二级子命令 |
@@ -79,7 +90,7 @@ prune 并先确认。
 | Compose | `docker compose` / `docker-compose`——见下方章节 |
 | 其他 | version, info |
 
-明确**不支持**（会给出明确报错和替代建议）：attach, commit, pause/unpause,
+明确**不支持**（会给出明确报错和替代建议）：attach, pause/unpause,
 top, port, wait, events, history, swarm, context——这些在
 apple/container 中没有对应能力。
 
@@ -108,7 +119,9 @@ docker compose pull / build / config
 
 - **服务发现**：Apple container 没有可用的裸名 DNS，shim 在 `up` 之后把每个
   服务的 IP 写进项目内所有容器的 `/etc/hosts`——服务间照常用服务名互访。
-  要求镜像内有 `/bin/sh`；`up`/`start`/`restart` 时会重写 IP。
+  要求镜像内有 `/bin/sh`；`up`/`start`/`restart` 时会重写 IP。container 1.6
+  新增了 DNS 别名，但只在配置了 DNS 域时生效，且上游仍不支持自定义网络上的
+  裸名解析（apple/container#1809），所以继续用 `/etc/hosts` 方案。
 - 资源命名与 compose 一致：容器 `<项目>-<服务>-1`、网络 `<项目>_default`、
   卷 `<项目>_<卷名>`。
 - 不支持（告警后忽略）：`restart:` 策略、`healthcheck`、
@@ -190,9 +203,13 @@ DOCKER_SHIM_REGISTRY_SCHEME=http docker pull ... # 强制 registry 访问协议
 python3 -m unittest discover -s tests -v
 ```
 
-1.5.0 已实测：多容器启动、启动失败后继续处理、run/create 清空入口、Compose
-up/ps 和前台/后台 run 的命令覆盖。验证使用临时资源，结束后清理；镜像构建、
-远程 registry 和交互 TTY 未在本次更新中重新实测。
+1.6.1 已实测：run/exec/logs/ps/restart/stop/rm、端口映射、`--platform` 跑 amd64
+镜像、清空入口、inspect 镜像回退、`docker build`（1.6 起是 container 的 CLI
+插件）、对运行中和已停止容器的 `commit`、`--network-alias`、`docker stop` 的
+SIGTERM 送达，以及 Compose up/ps/exec/down 和服务名互访。验证使用临时资源，
+结束后清理；远程 registry 和交互 TTY 未在本次更新中重新实测。1.6.1 仍会忽略
+空的 `--entrypoint`，shim 的绕行逻辑继续保留。升级后第一次运行会拉取新的
+init 镜像（约 66 MB）。
 
 ## 协议
 

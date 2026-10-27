@@ -3,7 +3,7 @@
 docker-shim: translate Docker CLI invocations into Apple `container` CLI calls.
 
 Targets apple/container 1.x (https://github.com/apple/container);
-tested against 1.5.0 and previously 1.3.1.
+tested against 1.6.1 and previously 1.5.0 / 1.3.1.
 
 Environment variables:
   DOCKER_SHIM_DEBUG=1          print the translated command before running it
@@ -14,6 +14,7 @@ Environment variables:
   DOCKER_SHIM_PULL_ALL_PLATFORMS=1  pull every architecture, not just the host's
 """
 
+import json
 import os
 import shlex
 import subprocess
@@ -21,7 +22,7 @@ import sys
 
 from shim_common import prepare_run_args
 
-SHIM_VERSION = "0.5.0"
+SHIM_VERSION = "0.6.0"
 CONTAINER_BIN = os.environ.get("DOCKER_SHIM_CONTAINER_BIN", "container")
 DEBUG = os.environ.get("DOCKER_SHIM_DEBUG", "") not in ("", "0")
 STRICT = os.environ.get("DOCKER_SHIM_STRICT", "") not in ("", "0")
@@ -204,6 +205,13 @@ def map_network(val):
     return ["--network", val]
 
 
+NET_ALIAS = "!network-alias"  # placeholder folded into --network by cmd_run
+
+
+def network_alias(val):
+    return [NET_ALIAS, val]
+
+
 def quiet_progress(_val=None):
     return ["--progress", "none"]
 
@@ -277,6 +285,7 @@ RUN_SPEC = {
         "--tmpfs": "--tmpfs",
         "--name": "--name",
         "--network": map_network, "--net": map_network,
+        "--network-alias": network_alias, "--net-alias": network_alias,
         "-p": "--publish", "--publish": "--publish",
         "--entrypoint": "--entrypoint",
         "-l": "--label", "--label": "--label",
@@ -517,6 +526,15 @@ VOLUME_CREATE_SPEC = {
     },
 }
 
+COMMIT_SPEC = {
+    "bool": {"-p": SILENT, "--pause": SILENT},
+    "value": {
+        "-a": DROP, "--author": DROP,
+        "-m": DROP, "--message": DROP,
+        "-c": DROP, "--change": DROP,
+    },
+}
+
 EMPTY_SPEC = {"bool": {}, "value": {}}
 
 
@@ -540,9 +558,57 @@ def host_platform():
     return f"linux/{arch}" if arch else None
 
 
+def dns_domain():
+    """Default DNS domain from container's config.toml ([dns] domain), if any."""
+    r = subprocess.run([CONTAINER_BIN, "system", "property", "list", "--format", "json"],
+                       capture_output=True, text=True)
+    try:
+        return ((json.loads(r.stdout) or {}).get("dns") or {}).get("domain")
+    except (ValueError, AttributeError):
+        return None
+
+
+def fold_network_aliases(flags):
+    """docker --network-alias → container 1.6 '--network <name>,alias=<alias>'.
+
+    Apple container only accepts dotted aliases unless a default DNS domain is
+    configured, and serves them from its DNS domain; single-label aliases are
+    dropped with a warning when no domain is set.
+    """
+    out, aliases = [], []
+    i = 0
+    while i < len(flags):
+        if flags[i] == NET_ALIAS:
+            aliases.append(flags[i + 1])
+            i += 2
+        else:
+            out.append(flags[i])
+            i += 1
+    if not aliases:
+        return flags
+    if any("." not in a for a in aliases) and not dns_domain():
+        dropped = [a for a in aliases if "." not in a]
+        aliases = [a for a in aliases if "." in a]
+        msg = (f"network aliases {dropped} need a DNS domain on Apple container "
+               "(set [dns] domain in ~/.config/container/config.toml); dropping them")
+        if STRICT:
+            die(msg)
+        warn(msg)
+    if not aliases:
+        return out
+    suffix = "".join(f",alias={a}" for a in aliases)
+    if "--network" in out:
+        idx = out.index("--network") + 1
+        out[idx] += suffix
+    else:
+        out += ["--network", "default" + suffix]
+    return out
+
+
 def cmd_run(target, name, rest):
     """run/create: pick the registry scheme from the image reference."""
     flags, pos, frozen = translate(rest, RUN_SPEC, name)
+    flags = fold_network_aliases(flags)
     if not pos and frozen:
         pos, frozen = frozen[:1], frozen[1:]
     if pos:
@@ -596,6 +662,20 @@ def cmd_start(rest):
         if result and not rc:
             rc = result
     sys.exit(rc)
+
+
+def cmd_commit(rest):
+    """container 1.6+ commit: CONTAINER REPOSITORY[:TAG], no options."""
+    # docker accepts --pause=false; container never pauses, so drop it quietly
+    rest = [t for t in rest if not t.startswith("--pause=")]
+    flags, pos, frozen = translate(rest, COMMIT_SPEC, "commit")
+    args = pos + frozen
+    if "--help" in flags:
+        execute([CONTAINER_BIN, *GLOBAL_FLAGS, "commit", "--help"])
+    if len(args) != 2:
+        die("'commit' requires CONTAINER and REPOSITORY[:TAG] on Apple container "
+            "(untagged commits are not supported)")
+    execute([CONTAINER_BIN, *GLOBAL_FLAGS, "commit", *args])
 
 
 def cmd_restart(rest):
@@ -765,14 +845,14 @@ Usage: docker COMMAND [ARGS...]
 
 Translated commands:
   run, create, exec, ps, start, stop, restart*, kill, rm, logs, cp, stats,
-  inspect, export, pull, push, images, rmi, tag, save, load, build,
+  inspect, export, commit, pull, push, images, rmi, tag, save, load, build,
   login, logout, version, info, compose (see 'docker compose --help')
   image / container / volume / network / system subcommand groups
 
 * restart is emulated as stop + start.
 
 Everything is forwarded to the `container` CLI (apple/container 1.x, tested
-against 1.5.0). Unsupported docker flags are dropped with a warning
+against 1.6.1). Unsupported docker flags are dropped with a warning
 (DOCKER_SHIM_STRICT=1 to fail). DOCKER_SHIM_DEBUG=1 prints each translated
 command. Registries on localhost are contacted over http (container 1.3 defaults
 to https); DOCKER_SHIM_REGISTRY_SCHEME=http|https overrides that.
@@ -804,6 +884,7 @@ HANDLERS = {
     "stats":   lambda r: run_generic(["stats"], STATS_SPEC, "stats", r),
     "inspect": cmd_inspect,
     "export":  lambda r: run_generic(["export"], EXPORT_SPEC, "export", r),
+    "commit":  cmd_commit,
     "pull":    cmd_pull,
     "push":    cmd_push,
     "images":  lambda r: run_generic(["image", "list"], IMAGES_SPEC, "images", r,
@@ -820,7 +901,6 @@ HANDLERS = {
     # no equivalents:
     "attach":  cmd_unsupported("attach", "use 'docker logs -f <id>' or "
                                "'docker exec -it <id> sh'"),
-    "commit":  cmd_unsupported("commit"),
     "diff":    cmd_unsupported("diff"),
     "events":  cmd_unsupported("events"),
     "history": cmd_unsupported("history"),

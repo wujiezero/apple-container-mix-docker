@@ -25,7 +25,7 @@ import threading
 
 from shim_common import prepare_run_args
 
-SHIM_VERSION = "0.5.0"
+SHIM_VERSION = "0.6.0"
 CONTAINER_BIN = os.environ.get("DOCKER_SHIM_CONTAINER_BIN", "container")
 DEBUG = os.environ.get("DOCKER_SHIM_DEBUG", "") not in ("", "0")
 

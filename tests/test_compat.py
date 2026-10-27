@@ -27,6 +27,9 @@ class CompatibilityTests(unittest.TestCase):
             "    f.write(json.dumps(args) + '\\n')\n"
             "if args and args[0] == 'start' and '__fail__' in args:\n"
             "    sys.exit(7)\n"
+            "if args[:3] == ['system', 'property', 'list']:\n"
+            "    print(os.environ.get('SHIM_TEST_PROPERTIES', '{}'))\n"
+            "    sys.exit(0)\n"
             "print('[]' if args and args[0] == 'list' else json.dumps(args))\n"
         )
         self.backend.chmod(0o755)
@@ -219,6 +222,48 @@ class CompatibilityTests(unittest.TestCase):
                 self.assertEqual(call[-2:], ["redis:7-alpine", "argument"])
                 self.assertNotIn("with", call)
                 self.assertNotIn("spaces/tool", call)
+
+    def test_commit_maps_to_native_commit(self):
+        for prefix in ([], ["container"]):
+            with self.subTest(prefix=prefix):
+                result = self.cli(*prefix, "commit", "--pause=false", "web", "snap:1")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.calls()[-1], ["commit", "web", "snap:1"])
+
+    def test_commit_requires_a_reference(self):
+        result = self.cli("commit", "web")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls(), [])
+
+    def test_commit_change_is_unsupported(self):
+        result = self.cli("commit", "-c", "CMD [\"sh\"]", "web", "snap:1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not support -c", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_network_alias_folds_into_network(self):
+        result = self.cli("run", "--network", "backend", "--network-alias", "api.test",
+                          "--network-alias=db.test", "alpine", "true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.last_run(), ["run", "--network",
+            "backend,alias=api.test,alias=db.test", "alpine", "true"])
+
+    def test_network_alias_without_network_uses_default(self):
+        self.env["SHIM_TEST_PROPERTIES"] = '{"dns": {"domain": "test"}}'
+        result = self.cli("create", "--network-alias", "api", "alpine")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.last_run(), ["create", "--network", "default,alias=api",
+                                          "alpine"])
+
+    def test_single_label_alias_needs_dns_domain(self):
+        result = self.cli("run", "--network-alias", "api", "alpine", "true")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DNS domain", result.stderr)
+        self.assertEqual([c for c in self.calls() if c[0] == "run"], [])
+        self.env["DOCKER_SHIM_STRICT"] = "0"
+        result = self.cli("run", "--network-alias", "api", "alpine", "true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.last_run(), ["run", "alpine", "true"])
 
 
 if __name__ == "__main__":

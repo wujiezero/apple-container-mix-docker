@@ -7,8 +7,8 @@ it translates `docker` commands into the corresponding `container` CLI calls, so
 `docker pull redis`, `docker run -d -p 6379:6379 redis`, `docker exec -it ... sh`
 and friends keep working on a Mac with no Docker installed.
 
-Tested against apple/container **1.5.0** on Apple Silicon; previously validated
-against 1.3.1.
+Tested against apple/container **1.6.1** on Apple Silicon; previously validated
+against 1.5.0 and 1.3.1.
 
 ## Requirements
 
@@ -75,11 +75,24 @@ error. No shell is introduced, so spaces and special characters remain literal
 arguments. Compose `entrypoint: []` / `entrypoint: ""` has the same behavior and
 requires an explicit `command` or `compose run SERVICE COMMAND`.
 
+`docker commit CONTAINER REPOSITORY[:TAG]` maps to `container commit`
+(container 1.6+). `-a/-m/-c` are dropped with a warning and a reference is
+required. Unlike Docker, the committed image records the container's process as
+`Entrypoint=[argv0]` plus `Cmd=[rest]`, so `docker run IMAGE other-cmd` passes
+`other-cmd` as arguments to that executable; use
+`docker run --entrypoint "" IMAGE other-cmd` to run a different command.
+
+`--network-alias NAME` maps to container 1.6's
+`--network <net>,alias=NAME` (the default network if no `--network` is given).
+Aliases are served by container's DNS domain: single-label names need
+`[dns] domain` in `~/.config/container/config.toml` and are dropped with a
+warning otherwise; dotted names such as `api.test` are passed through.
+
 ## Supported commands
 
 | Area | Commands |
 | --- | --- |
-| Containers | run, create, exec, ps, start, stop, kill, rm, logs, cp, stats, inspect, export, restart (emulated) |
+| Containers | run, create, exec, ps, start, stop, kill, rm, logs, cp, stats, inspect, export, commit, restart (emulated) |
 | Images | pull, push, images, rmi, tag, save, load, build |
 | Auth | login, logout |
 | Groups | `docker container/image/volume/network/system ...` subcommands |
@@ -88,7 +101,7 @@ requires an explicit `command` or `compose run SERVICE COMMAND`.
 | Misc | version, info |
 
 Explicitly **unsupported** (clear error + suggested alternative): attach,
-commit, pause/unpause, top, port, wait, events, history, swarm, context —
+pause/unpause, top, port, wait, events, history, swarm, context —
 apple/container has no equivalent capability.
 
 ## docker compose
@@ -119,7 +132,10 @@ Details worth knowing:
   after `up` the shim writes every service's IP into `/etc/hosts` of all
   project containers — services reach each other by service name as usual.
   This requires `/bin/sh` in the image; IPs are re-written by
-  `up`/`start`/`restart`.
+  `up`/`start`/`restart`. container 1.6 added DNS aliases, but they resolve only
+  under a configured DNS domain and upstream still does not resolve bare names
+  on custom networks (apple/container#1809), so `/etc/hosts` remains the
+  mechanism.
 - Project resources are namespaced like compose: containers
   `<project>-<service>-1`, network `<project>_default`, volumes
   `<project>_<name>`.
@@ -208,11 +224,15 @@ modified):
 python3 -m unittest discover -s tests -v
 ```
 
-Validated on 1.5.0: multi-container start, continuation after a failed start,
-empty entrypoints with run/create, Compose up/ps, and command overrides with
-attached/detached Compose run. Temporary resources were cleaned up afterward.
-Image builds, remote registries, and interactive TTY behavior were not retested
-in this update.
+Validated on 1.6.1: run/exec/logs/ps/restart/stop/rm, port publishing,
+amd64 images via `--platform`, empty entrypoints, inspect image fallback,
+`docker build` (now a container CLI plugin), `commit` of running and stopped
+containers, `--network-alias`, SIGTERM delivery on `docker stop`, and Compose
+up/ps/exec/down with service-name discovery. Temporary resources were cleaned
+up afterward. Remote registries and interactive TTY behavior were not retested
+in this update. Apple container 1.6.1 still ignores an empty `--entrypoint`, so
+the shim's workaround remains in place. The first run after upgrading fetches a
+new init image (about 66 MB).
 
 ## License
 

@@ -12,9 +12,10 @@ _RUN_BOOLEAN_FLAGS = {
 def prepare_run_args(flags, image, command):
     """Return native run/create args, honoring the final entrypoint override.
 
-    Apple container 1.5 ignores an explicit empty entrypoint and falls back to
-    the image entrypoint. Use the explicit command's executable as the native
-    entrypoint instead, preserving argv without requiring a shell in the image.
+    Apple container 1.5 (still true in 1.6.1) ignores an explicit empty
+    entrypoint and falls back to the image entrypoint. Use the explicit
+    command's executable as the native entrypoint instead, preserving argv
+    without requiring a shell in the image.
     """
     output = []
     entrypoint = None
